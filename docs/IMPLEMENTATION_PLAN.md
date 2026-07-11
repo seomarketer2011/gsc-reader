@@ -4,7 +4,7 @@ Small, independently testable phases. Each phase is committed separately and the
 app must build and pass tests at every phase boundary. Live Google Search Console
 is not connected until the fixture-data application is working and tested.
 
-## Phase 1 — Application shell on fixture data  ← current phase
+## Phase 1 — Application shell on fixture data  ✅ complete
 
 Next.js + TypeScript in `apps/web`, no external services, no credentials.
 
@@ -22,7 +22,7 @@ Next.js + TypeScript in `apps/web`, no external services, no credentials.
 **Done when:** `npm run build` and `npm test` pass; every screen renders with
 realistic data; recommendations show full evidence.
 
-## Phase 2 — Supabase application database
+## Phase 2 — Supabase application database  ← current phase
 
 Schema migrations for the tables in `docs/DATA_MODEL.md`; auth (login,
 organisations, membership); saved filters and recommendation status move from
