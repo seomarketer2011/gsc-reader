@@ -22,6 +22,16 @@ npm test           # unit tests (scoring + fixture determinism)
 npm run build      # production build
 ```
 
+## Deploying (Cloudflare)
+
+The app ships with Cloudflare's OpenNext adapter (`apps/web/wrangler.jsonc`).
+In the Cloudflare dashboard: **Workers & Pages → Create → Import a repository**,
+pick this repo, set the root directory to `apps/web`, build command
+`npx opennextjs-cloudflare build`, deploy command `npx wrangler deploy`. Add the
+environment variables from `apps/web/.env.example` as Worker
+**Variables & Secrets** — never in the repo. Local check: `npm run cf:preview`.
+(Vercel also works with zero config if preferred.)
+
 ## Documentation
 
 | Doc | Contents |

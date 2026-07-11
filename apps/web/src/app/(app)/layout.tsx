@@ -1,7 +1,9 @@
 import { Suspense } from "react";
+import { redirect } from "next/navigation";
 import { GlobalBar } from "@/components/GlobalBar";
 import { SideNav } from "@/components/SideNav";
 import { AppStateProvider } from "@/components/AppStateProvider";
+import { AuthWatcher } from "@/components/AuthWatcher";
 import { ensureOrganisation, signOut } from "@/lib/auth/actions";
 import { getServerClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/supabase/config";
@@ -26,15 +28,15 @@ export default async function AppLayout({
     const {
       data: { user },
     } = (await supabase?.auth.getUser()) ?? { data: { user: null } };
-    if (user) {
-      email = user.email ?? null;
-      userId = user.id;
-      orgId = await ensureOrganisation();
-    }
+    if (!user) redirect("/login");
+    email = user.email ?? null;
+    userId = user.id;
+    orgId = await ensureOrganisation();
   }
 
   return (
     <AppStateProvider value={{ configured, userId, orgId, email }}>
+      <AuthWatcher />
       <div className="flex min-h-screen">
         <aside className="hidden w-60 shrink-0 flex-col border-r border-edge bg-surface md:flex">
           <div className="border-b border-edge px-4 py-3.5">

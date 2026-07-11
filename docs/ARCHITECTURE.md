@@ -28,7 +28,7 @@ never run against Postgres.
 
 ## Components
 
-### `apps/web` — Next.js dashboard (Vercel)
+### `apps/web` — Next.js dashboard (Cloudflare Workers via OpenNext; Vercel also supported)
 
 TypeScript, App Router. Global Network → Campaign → Site selectors, Opportunity
 Inbox, coverage matrix, site/cluster views, rollout builder. Phase 1 runs entirely

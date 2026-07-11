@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gsc-reader",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  }
+  // Environment variables (NEXT_PUBLIC_SUPABASE_URL, keys, …) are NOT set
+  // here — add them as Variables & Secrets on the Worker in the Cloudflare
+  // dashboard so they never enter the repository.
+}

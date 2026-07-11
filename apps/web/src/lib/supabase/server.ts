@@ -16,8 +16,9 @@ export async function getServerClient(): Promise<SupabaseClient | null> {
             cookieStore.set(name, value, options);
           }
         } catch {
-          // Called from a Server Component — session refresh cookies are
-          // written by the proxy instead, so this is safe to ignore.
+          // Called from a Server Component, which cannot write cookies.
+          // Token refresh cookies are written client-side by the browser
+          // client (see AuthWatcher), so this is safe to ignore.
         }
       },
     },
