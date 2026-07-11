@@ -1,6 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "gsc-reader",
+  // Seomarketer2011@yahoo.co.uk's Cloudflare account (account IDs are not secret).
+  "account_id": "44799b719f2192a9f066f425aaff3106",
   "main": ".open-next/worker.js",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
