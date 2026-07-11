@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Builds
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# Environment / secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*credentials*.json
+*service-account*.json
+
+# Logs and caches
+npm-debug.log*
+.turbo/
+.cache/
+coverage/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
