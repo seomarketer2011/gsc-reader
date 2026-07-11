@@ -9,6 +9,7 @@ const ITEMS = [
   { href: "/sites", label: "Sites", icon: "⌂" },
   { href: "/clusters", label: "Query clusters", icon: "≣" },
   { href: "/rollouts", label: "Rollouts", icon: "⇶" },
+  { href: "/connections", label: "Google connections", icon: "⚲" },
 ];
 
 // Sidebar navigation. Preserves the global scope/date/compare selection when
