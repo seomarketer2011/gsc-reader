@@ -2,9 +2,9 @@
 
 import { useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Opportunity, OpportunityType, SavedFilter, Site } from "@/lib/types";
+import { Opportunity, OpportunityType, Site } from "@/lib/types";
 import { OPPORTUNITY_TYPE_LABEL } from "@/lib/format";
-import { useLocalList } from "@/lib/useLocalList";
+import { newId, useDismissals, useSavedFilters } from "@/lib/collections";
 import { EmptyState } from "./ui";
 import { OpportunityCard } from "./OpportunityCard";
 
@@ -26,9 +26,13 @@ export function InboxClient({
   const minImpressions = Number(params.get("minImpr") ?? "0");
   const query = params.get("q") ?? "";
 
-  const [dismissed, setDismissed] = useLocalList<string[]>("dismissed-opportunities", []);
-  const [saved, setSaved] = useLocalList<SavedFilter[]>("saved-filters", []);
+  const dismissals = useDismissals();
+  const saved = useSavedFilters();
   const [filterName, setFilterName] = useState("");
+  const dismissedIds = useMemo(
+    () => new Set(dismissals.items.map((d) => d.id)),
+    [dismissals.items],
+  );
 
   function setParam(key: string, value: string) {
     const next = new URLSearchParams(params.toString());
@@ -40,14 +44,14 @@ export function InboxClient({
   const visible = useMemo(
     () =>
       opportunities.filter((o) => {
-        if (dismissed.includes(o.id)) return false;
+        if (dismissedIds.has(o.id)) return false;
         if (typeFilter && o.type !== typeFilter) return false;
         if (confidenceFilter && o.confidence !== confidenceFilter) return false;
         if (o.networkImpressions < minImpressions) return false;
         if (query && !o.title.toLowerCase().includes(query.toLowerCase())) return false;
         return true;
       }),
-    [opportunities, dismissed, typeFilter, confidenceFilter, minImpressions, query],
+    [opportunities, dismissedIds, typeFilter, confidenceFilter, minImpressions, query],
   );
 
   function saveCurrentFilter() {
@@ -58,10 +62,9 @@ export function InboxClient({
       const v = params.get(key);
       if (v) kept.set(key, v);
     }
-    setSaved([
-      ...saved.filter((f) => f.name !== name),
-      { id: `flt-${Date.now()}`, name, params: kept.toString() },
-    ]);
+    const existing = saved.items.find((f) => f.name === name);
+    if (existing) saved.remove(existing.id);
+    saved.add({ id: newId(), name, params: kept.toString() });
     setFilterName("");
   }
 
@@ -122,7 +125,7 @@ export function InboxClient({
         <span className="text-xs font-medium uppercase tracking-wide text-muted">
           Saved filters
         </span>
-        {saved.map((f) => (
+        {saved.items.map((f) => (
           <span key={f.id} className="inline-flex items-center rounded-full border border-edge">
             <button
               onClick={() => router.push(`${pathname}?${f.params}`)}
@@ -131,7 +134,7 @@ export function InboxClient({
               {f.name}
             </button>
             <button
-              onClick={() => setSaved(saved.filter((s) => s.id !== f.id))}
+              onClick={() => saved.remove(f.id)}
               aria-label={`Delete saved filter ${f.name}`}
               className="pr-2 text-muted hover:text-critical"
             >
@@ -139,7 +142,7 @@ export function InboxClient({
             </button>
           </span>
         ))}
-        {saved.length === 0 && <span className="text-muted">none yet</span>}
+        {saved.items.length === 0 && <span className="text-muted">none yet</span>}
         <input
           className={`${input} w-36`}
           placeholder="Filter name"
@@ -176,19 +179,19 @@ export function InboxClient({
               key={opp.id}
               opportunity={opp}
               sitesById={sitesById}
-              onDismiss={(id) => setDismissed([...dismissed, id])}
+              onDismiss={(id) => dismissals.add({ id })}
             />
           ))}
         </div>
       )}
 
-      {dismissed.length > 0 && (
+      {dismissals.items.length > 0 && (
         <button
-          onClick={() => setDismissed([])}
+          onClick={() => dismissals.clear()}
           className="mt-4 text-sm font-medium text-muted hover:text-ink"
         >
-          Restore {dismissed.length} dismissed{" "}
-          {dismissed.length === 1 ? "opportunity" : "opportunities"}
+          Restore {dismissals.items.length} dismissed{" "}
+          {dismissals.items.length === 1 ? "opportunity" : "opportunities"}
         </button>
       )}
     </div>

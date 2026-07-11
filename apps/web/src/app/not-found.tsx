@@ -1,11 +1,13 @@
-import { EmptyState } from "@/components/ui";
+import Link from "next/link";
 
-export default function NotFound() {
+export default function RootNotFound() {
   return (
-    <EmptyState
-      title="Not found"
-      body="This site, cluster or opportunity does not exist in the current dataset. It may have been removed in a newer analysis run."
-      action={{ href: "/", label: "Back to the Opportunity Inbox" }}
-    />
+    <div className="flex min-h-screen flex-col items-center justify-center gap-2 bg-page p-6 text-center">
+      <div className="text-base font-semibold text-ink">Page not found</div>
+      <p className="max-w-md text-sm text-ink-2">This address does not exist.</p>
+      <Link href="/" className="mt-2 text-sm font-medium text-series-1 hover:underline">
+        Back to the Opportunity Inbox
+      </Link>
+    </div>
   );
 }

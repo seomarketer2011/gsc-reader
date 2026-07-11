@@ -1,7 +1,6 @@
 "use client";
 
-import { Rollout } from "@/lib/types";
-import { useLocalList } from "@/lib/useLocalList";
+import { useRollouts } from "@/lib/collections";
 import { Badge, Card, EmptyState, Skeleton } from "./ui";
 
 export function RolloutListClient({
@@ -9,11 +8,11 @@ export function RolloutListClient({
 }: {
   sitesById: Record<string, { name: string }>;
 }) {
-  const [rollouts, setRollouts, ready] = useLocalList<Rollout[]>("rollouts", []);
+  const rollouts = useRollouts();
 
-  if (!ready) return <Skeleton className="h-48" />;
+  if (!rollouts.ready) return <Skeleton className="h-48" />;
 
-  if (rollouts.length === 0) {
+  if (rollouts.items.length === 0) {
     return (
       <EmptyState
         title="No rollouts yet"
@@ -25,7 +24,7 @@ export function RolloutListClient({
 
   return (
     <div className="space-y-3">
-      {rollouts.map((r) => (
+      {rollouts.items.map((r) => (
         <Card key={r.id} className="p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
@@ -41,7 +40,7 @@ export function RolloutListClient({
               <button
                 onClick={() => {
                   if (window.confirm("Delete this rollout draft?")) {
-                    setRollouts(rollouts.filter((x) => x.id !== r.id));
+                    rollouts.remove(r.id);
                   }
                 }}
                 className="text-sm font-medium text-muted hover:text-critical"

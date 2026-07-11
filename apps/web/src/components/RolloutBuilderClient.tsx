@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Opportunity, Rollout, Site } from "@/lib/types";
 import { formatInt } from "@/lib/format";
-import { useLocalList } from "@/lib/useLocalList";
+import { newId, nowIso, useRollouts } from "@/lib/collections";
 import { Badge, Card } from "./ui";
 
 function buildRollout(
@@ -15,13 +15,13 @@ function buildRollout(
   reviewPlans: Opportunity["sitePlans"],
 ): Rollout {
   return {
-    id: `rollout-${Date.now()}`,
+    id: newId(),
     opportunityId: opportunity.id,
     blueprintTitle: opportunity.title.replace(/^Create “|” pages across the network$/g, ""),
     batches,
     excludedSiteIds: excludedPlans.map((p) => p.siteId),
     reviewSiteIds: reviewPlans.map((p) => p.siteId),
-    createdAt: new Date().toISOString(),
+    createdAt: nowIso(),
     status: "draft",
   };
 }
@@ -34,7 +34,7 @@ export function RolloutBuilderClient({
   sitesById: Record<string, Pick<Site, "id" | "name" | "domain" | "location">>;
 }) {
   const router = useRouter();
-  const [rollouts, setRollouts] = useLocalList<Rollout[]>("rollouts", []);
+  const rollouts = useRollouts();
   const [batchSize, setBatchSize] = useState(10);
 
   const createPlans = useMemo(
@@ -69,8 +69,7 @@ export function RolloutBuilderClient({
   }, [createPlans, selected, batchSize]);
 
   function createRollout() {
-    const rollout = buildRollout(opportunity, batches, excludedPlans, reviewPlans);
-    setRollouts([...rollouts, rollout]);
+    rollouts.add(buildRollout(opportunity, batches, excludedPlans, reviewPlans));
     router.push("/rollouts");
   }
 
