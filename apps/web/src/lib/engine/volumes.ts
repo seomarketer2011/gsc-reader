@@ -3,11 +3,19 @@
 
 import { SupabaseClient } from "@supabase/supabase-js";
 
+export interface MonthlyVolume {
+  year: number;
+  month: number;
+  search_volume: number;
+}
+
 export interface KeywordVolume {
   keyword: string;
   searchVolume: number | null;
   cpc: number | null;
   competition: string | null;
+  competitionIndex: number | null;
+  monthly: MonthlyVolume[] | null;
 }
 
 const LOCATION = "United Kingdom";
@@ -41,6 +49,8 @@ async function fetchFromApi(keywords: string[]): Promise<Map<string, KeywordVolu
         searchVolume: r.search_volume ?? null,
         cpc: r.cpc ?? null,
         competition: r.competition ?? null,
+        competitionIndex: r.competition_index ?? null,
+        monthly: Array.isArray(r.monthly_searches) ? r.monthly_searches : null,
       });
     }
   }
@@ -59,7 +69,7 @@ export async function getVolumes(
 
   const { data: cached } = await service
     .from("keyword_volumes")
-    .select("keyword, search_volume, cpc, competition, fetched_at")
+    .select("keyword, search_volume, cpc, competition, competition_index, monthly, fetched_at")
     .eq("organisation_id", orgId)
     .in("keyword", unique);
   const cutoff = Date.now() - REFRESH_DAYS * 86400000;
@@ -70,6 +80,8 @@ export async function getVolumes(
         searchVolume: (row.search_volume as number) ?? null,
         cpc: row.cpc === null ? null : Number(row.cpc),
         competition: (row.competition as string) ?? null,
+        competitionIndex: (row.competition_index as number) ?? null,
+        monthly: (row.monthly as MonthlyVolume[]) ?? null,
       });
     }
   }
@@ -78,7 +90,9 @@ export async function getVolumes(
   if (missing.length > 0 && dataForSeoConfigured()) {
     const fetched = await fetchFromApi(missing);
     const rows = missing.map((k) => {
-      const v = fetched.get(k) ?? { keyword: k, searchVolume: null, cpc: null, competition: null };
+      const v =
+        fetched.get(k) ??
+        ({ keyword: k, searchVolume: null, cpc: null, competition: null, competitionIndex: null, monthly: null } as KeywordVolume);
       out.set(k, v);
       return {
         organisation_id: orgId,
@@ -87,6 +101,8 @@ export async function getVolumes(
         search_volume: v.searchVolume,
         cpc: v.cpc,
         competition: v.competition,
+        competition_index: v.competitionIndex,
+        monthly: v.monthly,
         fetched_at: new Date().toISOString(),
       };
     });
