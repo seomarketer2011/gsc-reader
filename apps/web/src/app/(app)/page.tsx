@@ -1,6 +1,9 @@
 import { PageHeader, StatTile } from "@/components/ui";
 import { InboxClient } from "@/components/InboxClient";
 import { getOpportunities, getSites } from "@/lib/data";
+import { getRealSites } from "@/lib/data/real";
+import { Card } from "@/components/ui";
+import Link from "next/link";
 import { formatCompact, parseScope } from "@/lib/format";
 
 export default async function InboxPage({
@@ -10,7 +13,11 @@ export default async function InboxPage({
 }) {
   const params = await searchParams;
   const scope = parseScope(typeof params.scope === "string" ? params.scope : undefined);
-  const [opportunities, sites] = await Promise.all([getOpportunities(scope), getSites()]);
+  const [opportunities, sites, realSites] = await Promise.all([
+    getOpportunities(scope),
+    getSites(),
+    getRealSites(),
+  ]);
 
   const sitesById = Object.fromEntries(
     sites.map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain }]),
@@ -24,6 +31,16 @@ export default async function InboxPage({
         title="Opportunity Inbox"
         subtitle="Detected by deterministic rules, scored by network evidence — every card is fully explainable."
       />
+      {realSites.length > 0 && (
+        <Card className="mb-4 border-warning/50 p-3 text-sm text-ink-2">
+          These opportunity cards are <span className="font-medium text-ink">sample data</span>.
+          Your real Search Console data lives under{" "}
+          <Link href="/sites" className="font-medium text-series-1 hover:underline">
+            Sites
+          </Link>
+          ; the deterministic detectors that generate real opportunities arrive in Phase 4.
+        </Card>
+      )}
       <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatTile label="Open opportunities" value={String(opportunities.length)} />
         <StatTile

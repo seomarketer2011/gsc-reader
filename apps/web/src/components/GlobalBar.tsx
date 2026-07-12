@@ -85,7 +85,7 @@ export function GlobalBar({
         </select>
       </label>
       <span className="ml-auto hidden text-xs text-muted sm:block">
-        Fixture data · Phase 1 — no live Google connection
+        Analysis screens show demo data until Phase 4
       </span>
     </div>
   );

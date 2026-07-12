@@ -12,6 +12,45 @@ import {
   NotFoundError,
 } from "@/lib/data";
 import { COVERAGE_META, formatInt, formatPct, OPPORTUNITY_TYPE_LABEL } from "@/lib/format";
+import { getRealDailySeries, getRealSite, getRealTopPages, getRealTopQueries } from "@/lib/data/real";
+import { PageStat } from "@/lib/types";
+
+function StatTable({ title, rows, label }: { title: string; rows: PageStat[]; label: string }) {
+  return (
+    <Card className="overflow-x-auto">
+      <div className="border-b border-edge px-4 py-2.5 text-sm font-medium text-ink">{title}</div>
+      <table className="w-full text-left text-sm">
+        <thead className="text-xs uppercase tracking-wide text-muted">
+          <tr className="border-b border-edge">
+            <th className="px-4 py-2 font-medium">{label}</th>
+            <th className="px-4 py-2 text-right font-medium">Clicks</th>
+            <th className="px-4 py-2 text-right font-medium">Impr.</th>
+            <th className="px-4 py-2 text-right font-medium">CTR</th>
+            <th className="px-4 py-2 text-right font-medium">Pos.</th>
+            <th className="px-4 py-2 text-right font-medium">Δ clicks</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, 15).map((r) => (
+            <tr key={r.url} className="border-b border-edge last:border-0">
+              <td className="max-w-72 truncate px-4 py-1.5 text-ink" title={r.url}>{r.url}</td>
+              <td className="px-4 py-1.5 text-right text-ink tnum">{formatInt(r.clicks28d)}</td>
+              <td className="px-4 py-1.5 text-right text-ink-2 tnum">{formatInt(r.impressions28d)}</td>
+              <td className="px-4 py-1.5 text-right text-ink-2 tnum">{formatPct(r.ctr)}</td>
+              <td className="px-4 py-1.5 text-right text-ink-2 tnum">{r.position.toFixed(1)}</td>
+              <td className={`px-4 py-1.5 text-right font-medium tnum ${r.clicksChangePct >= 0 ? "text-delta-good" : "text-critical"}`}>
+                {r.clicksChangePct >= 0 ? "▲" : "▼"} {Math.abs(r.clicksChangePct)}%
+              </td>
+            </tr>
+          ))}
+          {rows.length === 0 && (
+            <tr><td colSpan={6} className="px-4 py-4 text-ink-2">No data in this window yet.</td></tr>
+          )}
+        </tbody>
+      </table>
+    </Card>
+  );
+}
 
 export default async function SitePage({
   params,
@@ -24,6 +63,48 @@ export default async function SitePage({
   const sp = await searchParams;
   const rangeDays = Math.min(Number(sp.range ?? 28) || 28, 90);
   const compareOn = sp.compare !== "none";
+
+  // Real tracked properties use database UUIDs; fixtures use "site-N".
+  if (siteId.length === 36) {
+    const real = await getRealSite(siteId);
+    if (!real) notFound();
+    const [series, pages, queries] = await Promise.all([
+      getRealDailySeries(real.propertyId, rangeDays * 2),
+      getRealTopPages(real.propertyId, 28),
+      getRealTopQueries(real.propertyId, 28),
+    ]);
+    const current = series.slice(-rangeDays);
+    const previous = series.slice(0, rangeDays);
+    const total = (pts: typeof series, key: "clicks" | "impressions") =>
+      pts.reduce((sum, p) => sum + p[key], 0);
+    const clicks = total(current, "clicks");
+    const prevClicks = total(previous, "clicks");
+    const impressions = total(current, "impressions");
+    const prevImpressions = total(previous, "impressions");
+    const delta = (now: number, before: number) => (before ? ((now - before) / before) * 100 : 0);
+    return (
+      <div>
+        <PageHeader
+          title={real.name}
+          subtitle={`${real.propertyUri} · real Search Console data`}
+        />
+        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <StatTile label={`Clicks (${rangeDays}d)`} value={formatInt(clicks)} delta={delta(clicks, prevClicks)} />
+          <StatTile label={`Impressions (${rangeDays}d)`} value={formatInt(impressions)} delta={delta(impressions, prevImpressions)} />
+          <StatTile label="CTR" value={impressions ? formatPct(clicks / impressions) : "—"} />
+          <StatTile label="Top queries (28d)" value={String(queries.length)} detail="distinct queries with impressions" />
+        </div>
+        <Card className="mb-5 p-4">
+          <div className="mb-2 text-sm font-medium text-ink">Daily clicks</div>
+          <TrendChart series={current} compare={compareOn ? previous : null} />
+        </Card>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <StatTable title="Top pages (28d)" rows={pages} label="Page" />
+          <StatTable title="Top queries (28d)" rows={queries} label="Query" />
+        </div>
+      </div>
+    );
+  }
 
   let site;
   try {

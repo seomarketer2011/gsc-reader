@@ -3,6 +3,8 @@ import { revalidatePath } from "next/cache";
 import { Badge, Card, EmptyState, PageHeader } from "@/components/ui";
 import { decryptToken, googleConfigured, GscProperty, listProperties, refreshAccessToken } from "@/lib/google/oauth";
 import { getServerClient } from "@/lib/supabase/server";
+import { hasImportedData } from "@/lib/data/real";
+import { ImportButton } from "@/components/ImportButton";
 
 export const dynamic = "force-dynamic";
 
@@ -73,8 +75,10 @@ export default async function ConnectionsPage({
     .from("google_connections")
     .select("id, organisation_id, google_account_email, refresh_token_encrypted, status")
     .order("created_at");
-  const { data: tracked } = await supabase.from("gsc_properties").select("property_uri");
-  const trackedSet = new Set((tracked ?? []).map((t) => t.property_uri));
+  const { data: tracked } = await supabase.from("gsc_properties").select("id, property_uri");
+  const trackedByUri = new Map((tracked ?? []).map((t) => [t.property_uri as string, t.id as string]));
+  const importedByProperty = new Map<string, boolean>();
+  for (const t of tracked ?? []) importedByProperty.set(t.id as string, await hasImportedData(t.id as string));
 
   // Live property list per active connection.
   const propertiesByConnection = new Map<string, GscProperty[] | { error: string }>();
@@ -159,8 +163,14 @@ export default async function ConnectionsPage({
                           <td className="px-4 py-2 text-ink">{p.siteUrl}</td>
                           <td className="px-4 py-2 text-ink-2">{p.permissionLevel}</td>
                           <td className="px-4 py-2 text-right">
-                            {trackedSet.has(p.siteUrl) ? (
-                              <Badge tone="good">tracked</Badge>
+                            {trackedByUri.has(p.siteUrl) ? (
+                              <span className="inline-flex items-center gap-2">
+                                <Badge tone="good">tracked</Badge>
+                                <ImportButton
+                                  propertyId={trackedByUri.get(p.siteUrl)!}
+                                  alreadyImported={importedByProperty.get(trackedByUri.get(p.siteUrl)!) ?? false}
+                                />
+                              </span>
                             ) : (
                               <form action={trackProperty} className="inline">
                                 <input type="hidden" name="orgId" value={conn.organisation_id} />
