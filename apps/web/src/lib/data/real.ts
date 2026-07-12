@@ -3,6 +3,7 @@
 // to fixtures when no real site exists yet.
 
 import { getServerClient } from "@/lib/supabase/server";
+import { clusterQueries, locationsFromDomains, QueryClusterAgg } from "@/lib/engine/cluster";
 import { DailyPoint, Opportunity, PageStat, QueryVariation } from "@/lib/types";
 
 export interface RealSite {
@@ -187,4 +188,47 @@ export async function getRealOpportunities(): Promise<Opportunity[]> {
       evidenceQueries,
     } as Opportunity;
   });
+}
+
+export interface RealCluster extends QueryClusterAgg {
+  siteName: string;
+  siteId: string;
+  searchVolume: number | null;
+  cpc: number | null;
+}
+
+/** 28-day query clusters per tracked property, enriched from the volume cache
+ * (read-only — never triggers a paid DataForSEO call). */
+export async function getRealClusters(): Promise<RealCluster[]> {
+  const supabase = await getServerClient();
+  if (!supabase) return [];
+  const sites = await getRealSites();
+  const extraLocations = locationsFromDomains(sites.map((s) => s.domain));
+  const out: RealCluster[] = [];
+  for (const site of sites) {
+    const queries = await getRealTopQueries(site.propertyId, 28);
+    const clusters = clusterQueries(
+      queries.map((q) => ({ query: q.url, clicks: q.clicks28d, impressions: q.impressions28d, position: q.position })),
+      extraLocations,
+    ).slice(0, 50);
+    const names = clusters.flatMap((c) => c.members.slice(0, 3).map((m) => m.query.toLowerCase().trim()));
+    const { data: vols } = await supabase
+      .from("keyword_volumes")
+      .select("keyword, search_volume, cpc")
+      .in("keyword", names.slice(0, 200));
+    const volByKeyword = new Map((vols ?? []).map((v) => [v.keyword as string, v]));
+    for (const c of clusters) {
+      let searchVolume: number | null = null;
+      let cpc: number | null = null;
+      for (const m of c.members.slice(0, 3)) {
+        const v = volByKeyword.get(m.query.toLowerCase().trim());
+        if (v?.search_volume && (searchVolume === null || v.search_volume > searchVolume)) {
+          searchVolume = v.search_volume as number;
+          cpc = v.cpc === null ? null : Number(v.cpc);
+        }
+      }
+      out.push({ ...c, siteName: site.name, siteId: site.id, searchVolume, cpc });
+    }
+  }
+  return out.sort((a, b) => (b.searchVolume ?? 0) - (a.searchVolume ?? 0) || b.impressions - a.impressions);
 }
