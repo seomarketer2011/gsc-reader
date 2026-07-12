@@ -8,16 +8,30 @@ import { ensureOrganisation, signOut } from "@/lib/auth/actions";
 import { getServerClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/supabase/config";
 import { getCampaigns, getNetwork, getOrganisation, getSites } from "@/lib/data";
+import { getRealSites } from "@/lib/data/real";
+import { Site } from "@/lib/types";
 
 export default async function AppLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
-  const [organisation, network, campaigns, sites] = await Promise.all([
+  const [organisation, ...fixture] = await Promise.all([
     getOrganisation(),
     getNetwork(),
     getCampaigns(),
     getSites(),
   ]);
+  let [network, campaigns, sites] = fixture as [
+    Awaited<ReturnType<typeof getNetwork>>,
+    Awaited<ReturnType<typeof getCampaigns>>,
+    Awaited<ReturnType<typeof getSites>>,
+  ];
+  // Real mode: the global selector lists tracked properties, not demo sites.
+  const realSites = await getRealSites();
+  if (realSites.length > 0) {
+    network = { id: "net-real", name: `Tracked properties (${realSites.length})`, siteIds: realSites.map((s) => s.id) };
+    campaigns = [];
+    sites = realSites.map((s) => ({ id: s.id, name: s.name }) as Site);
+  }
 
   const configured = isSupabaseConfigured();
   let email: string | null = null;

@@ -56,8 +56,8 @@ export async function getScopedSiteIds(scope: Scope): Promise<string[]> {
     return campaign.siteIds;
   }
   const site = w.sites.find((s) => s.id === scope.id);
-  if (!site) throw new NotFoundError(`Unknown site: ${scope.id}`);
-  return [site.id];
+  // Real-property ids are not in the fixture world — empty scope, not an error.
+  return site ? [site.id] : [];
 }
 
 export async function getCoverage(siteIds?: string[]): Promise<CoverageCell[]> {
