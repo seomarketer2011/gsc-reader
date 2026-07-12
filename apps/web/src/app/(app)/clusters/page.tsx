@@ -5,8 +5,19 @@ import { getRealClusters } from "@/lib/data/real";
 import { formatPct } from "@/lib/format";
 import { formatInt } from "@/lib/format";
 
-export default async function ClustersPage() {
-  const real = await getRealClusters();
+export default async function ClustersPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}) {
+  const params = await searchParams;
+  const scopeRaw = typeof params.scope === "string" ? params.scope : "";
+  let real = await getRealClusters();
+  // Honour the global site selector.
+  if (scopeRaw.startsWith("site:")) {
+    const siteId = scopeRaw.slice(5);
+    real = real.filter((c) => c.siteId === siteId);
+  }
   if (real.length > 0) {
     return (
       <div>
