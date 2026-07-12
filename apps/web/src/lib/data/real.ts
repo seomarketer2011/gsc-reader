@@ -184,7 +184,7 @@ export async function getRealOpportunities(): Promise<Opportunity[]> {
       whyItMatters: r.why_it_matters as string,
       proposedChange: r.proposed_change as string,
       risks: (r.risks as string[]) ?? [],
-      sitePlans: [],
+      sitePlans: Array.isArray(r.site_plans) ? r.site_plans : [],
       evidenceQueries,
     } as Opportunity;
   });

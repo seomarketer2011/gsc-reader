@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { runDetectors } from "@/lib/engine/detect";
+import { detectNetworkOpportunities } from "@/lib/engine/network";
 import { getServerClient, getServiceClient } from "@/lib/supabase/server";
 
 // Runs the Phase 4 detectors for every tracked property in the caller's org.
@@ -40,5 +41,11 @@ export async function POST() {
       perProperty[p.property_uri as string] = e instanceof Error ? e.message.slice(0, 120) : "failed";
     }
   }
-  return NextResponse.json({ opportunities: total, perProperty });
+  let network = 0;
+  try {
+    network = await detectNetworkOpportunities(service, { id: membership.organisation_id });
+  } catch (e) {
+    perProperty["network"] = e instanceof Error ? e.message.slice(0, 120) : "failed";
+  }
+  return NextResponse.json({ opportunities: total + network, network, perProperty });
 }

@@ -118,3 +118,40 @@ export async function importNextChunk(
   );
   return { done, importedDays, totalDays: BACKFILL_DAYS, rowsImported, oldestDate: cursor };
 }
+
+/** Nightly top-up: re-imports the last few days (GSC finalises data late). */
+export async function importRecentDays(
+  service: SupabaseClient,
+  property: { id: string; organisation_id: string; property_uri: string; google_connection_id: string },
+  days = 5,
+): Promise<number> {
+  const { data: conn } = await service
+    .from("google_connections")
+    .select("refresh_token_encrypted")
+    .eq("id", property.google_connection_id)
+    .single();
+  if (!conn?.refresh_token_encrypted) throw new Error("Connection has no stored token");
+  const accessToken = await refreshAccessToken(await decryptToken(conn.refresh_token_encrypted));
+  let rowsImported = 0;
+  for (let offset = FRESHNESS_LAG; offset < FRESHNESS_LAG + days; offset++) {
+    const date = day(offset);
+    const rows = await fetchDay(accessToken, property.property_uri, date);
+    if (rows.length === 0) continue;
+    const payload = rows.map((r) => ({
+      organisation_id: property.organisation_id,
+      gsc_property_id: property.id,
+      date,
+      query: r.keys[0],
+      page: r.keys[1],
+      clicks: r.clicks,
+      impressions: r.impressions,
+      position: Math.round(r.position * 100) / 100,
+    }));
+    const { error } = await service
+      .from("gsc_performance_daily")
+      .upsert(payload, { onConflict: "gsc_property_id,date,query,page" });
+    if (error) throw new Error(`upsert ${date} failed: ${error.message}`);
+    rowsImported += payload.length;
+  }
+  return rowsImported;
+}

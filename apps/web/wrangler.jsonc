@@ -3,7 +3,11 @@
   "name": "gsc-reader",
   // Seomarketer2011@yahoo.co.uk's Cloudflare account (account IDs are not secret).
   "account_id": "44799b719f2192a9f066f425aaff3106",
-  "main": ".open-next/worker.js",
+  "main": "worker-entry.mjs",
+  "triggers": {
+    // Nightly top-up import + re-analysis, 03:30 UTC.
+    "crons": ["30 3 * * *"]
+  },
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": {
