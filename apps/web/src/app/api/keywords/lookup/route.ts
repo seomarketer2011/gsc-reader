@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getVolumes } from "@/lib/engine/volumes";
-import { normaliseQuery } from "@/lib/engine/cluster";
+import { crossReferenceRankings, toResearchRows } from "@/lib/engine/research";
 import { getServerClient, getServiceClient } from "@/lib/supabase/server";
 
 const MAX_KEYWORDS = 700;
@@ -50,44 +50,8 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Cross-reference: does any of the org's tracked sites already rank?
-  const { data: ranking } = await service
-    .from("gsc_performance_daily")
-    .select("query, gsc_property_id, impressions, clicks, position, gsc_properties (property_uri)")
-    .eq("organisation_id", membership.organisation_id)
-    .in("query", keywords)
-    .gte("date", new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10))
-    .limit(20000);
-  const bestBySite = new Map<string, { site: string; impressions: number; posSum: number; n: number }>();
-  for (const r of ranking ?? []) {
-    const prop = (Array.isArray(r.gsc_properties) ? r.gsc_properties[0] : r.gsc_properties) as { property_uri: string } | null;
-    const site = (prop?.property_uri ?? "").replace(/^sc-domain:/, "");
-    const key = r.query as string;
-    const agg = bestBySite.get(key) ?? { site, impressions: 0, posSum: 0, n: 0 };
-    agg.impressions += Number(r.impressions);
-    agg.posSum += Number(r.position);
-    agg.n++;
-    if (site && !agg.site) agg.site = site;
-    bestBySite.set(key, agg);
-  }
-
-  const rows = keywords.map((k) => {
-    const v = volumes.get(k);
-    const rank = bestBySite.get(k);
-    return {
-      keyword: k,
-      cluster: normaliseQuery(k).key,
-      searchVolume: v?.searchVolume ?? null,
-      cpc: v?.cpc ?? null,
-      competition: v?.competition ?? null,
-      competitionIndex: v?.competitionIndex ?? null,
-      monthly: v?.monthly ?? null,
-      yourSite: rank?.site ?? null,
-      yourImpressions28d: rank?.impressions ?? 0,
-      yourPosition: rank && rank.n ? Math.round((rank.posSum / rank.n) * 10) / 10 : null,
-    };
-  });
-  rows.sort((a, b) => (b.searchVolume ?? -1) - (a.searchVolume ?? -1));
+  const rankings = await crossReferenceRankings(service, membership.organisation_id, keywords);
+  const rows = toResearchRows(keywords, volumes, rankings);
 
   return NextResponse.json({
     rows,

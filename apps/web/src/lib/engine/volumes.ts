@@ -112,3 +112,63 @@ export async function getVolumes(
   }
   return out;
 }
+
+/** Keyword ideas for up to 20 seed keywords (Google Ads "keywords for
+ * keywords"). Returns ideas WITH volume data; costs one paid call. */
+export async function fetchKeywordIdeas(seeds: string[]): Promise<KeywordVolume[]> {
+  const auth = Buffer.from(
+    `${process.env.DATAFORSEO_LOGIN}:${process.env.DATAFORSEO_PASSWORD}`,
+  ).toString("base64");
+  const res = await fetch(
+    "https://api.dataforseo.com/v3/keywords_data/google_ads/keywords_for_keywords/live",
+    {
+      method: "POST",
+      headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
+      body: JSON.stringify([
+        {
+          keywords: seeds.slice(0, 20),
+          location_name: "United Kingdom",
+          language_name: "English",
+          sort_by: "search_volume",
+        },
+      ]),
+    },
+  );
+  if (!res.ok) throw new Error(`DataForSEO HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  const task = data.tasks?.[0];
+  if (task?.status_code !== 20000) throw new Error(`DataForSEO task ${task?.status_code}: ${task?.status_message}`);
+  return (task.result ?? [])
+    .filter((r: { keyword?: string }) => r.keyword)
+    .map((r: Record<string, unknown>) => ({
+      keyword: String(r.keyword).toLowerCase().trim(),
+      searchVolume: (r.search_volume as number) ?? null,
+      cpc: (r.cpc as number) ?? null,
+      competition: (r.competition as string) ?? null,
+      competitionIndex: (r.competition_index as number) ?? null,
+      monthly: Array.isArray(r.monthly_searches) ? (r.monthly_searches as MonthlyVolume[]) : null,
+    }));
+}
+
+/** Store already-fetched volumes in the cache so later lookups are free. */
+export async function cacheVolumes(
+  service: SupabaseClient,
+  orgId: string,
+  volumes: KeywordVolume[],
+): Promise<void> {
+  if (volumes.length === 0) return;
+  await service.from("keyword_volumes").upsert(
+    volumes.map((v) => ({
+      organisation_id: orgId,
+      keyword: v.keyword,
+      location_name: LOCATION,
+      search_volume: v.searchVolume,
+      cpc: v.cpc,
+      competition: v.competition,
+      competition_index: v.competitionIndex,
+      monthly: v.monthly,
+      fetched_at: new Date().toISOString(),
+    })),
+    { onConflict: "organisation_id,keyword,location_name" },
+  );
+}

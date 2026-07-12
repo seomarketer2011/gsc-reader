@@ -30,7 +30,7 @@ function trendPct(monthly: Row["monthly"]): number | null {
 export function KeywordResearch() {
   const [input, setInput] = useState("");
   const [rows, setRows] = useState<Row[] | null>(null);
-  const [meta, setMeta] = useState<{ newlyFetched: number; fromCache: number } | null>(null);
+  const [meta, setMeta] = useState<{ newlyFetched?: number; fromCache?: number; discovered?: number; mode: "lookup" | "suggest" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,23 +45,27 @@ export function KeywordResearch() {
     [input],
   );
 
-  async function run() {
+  const [busyAction, setBusyAction] = useState<"lookup" | "suggest" | null>(null);
+
+  async function run(mode: "lookup" | "suggest") {
     setBusy(true);
+    setBusyAction(mode);
     setError(null);
     try {
-      const res = await fetch("/api/keywords/lookup", {
+      const res = await fetch(mode === "lookup" ? "/api/keywords/lookup" : "/api/keywords/suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keywords }),
+        body: JSON.stringify(mode === "lookup" ? { keywords } : { seeds: keywords.slice(0, 20) }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       setRows(data.rows);
-      setMeta({ newlyFetched: data.newlyFetched, fromCache: data.fromCache });
+      setMeta({ newlyFetched: data.newlyFetched, fromCache: data.fromCache, discovered: data.discovered, mode });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "lookup failed");
+      setError(e instanceof Error ? e.message : "request failed");
     } finally {
       setBusy(false);
+      setBusyAction(null);
     }
   }
 
@@ -109,14 +113,24 @@ export function KeywordResearch() {
         </label>
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <button
-            onClick={run}
+            onClick={() => run("lookup")}
             disabled={busy || keywords.length === 0}
             className="rounded-md bg-series-1 px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? "Fetching volumes…" : `Get volumes for ${keywords.length} keywords`}
+            {busyAction === "lookup" ? "Fetching volumes…" : `Get volumes for ${keywords.length} keywords`}
+          </button>
+          <button
+            onClick={() => run("suggest")}
+            disabled={busy || keywords.length === 0}
+            className="rounded-md border border-edge px-4 py-2 text-sm font-medium text-series-1 hover:bg-page disabled:opacity-50"
+          >
+            {busyAction === "suggest"
+              ? "Finding ideas…"
+              : `Find new keyword ideas from ${Math.min(keywords.length, 20)} seeds`}
           </button>
           <span className="text-xs text-muted">
-            Max 700 per run · United Kingdom · results cached for 30 days, repeat lookups are free
+            Volumes: max 700/run · Ideas: max 20 seeds, returns up to 300 suggestions · United
+            Kingdom · everything cached for 30 days
           </span>
         </div>
         {error && <p className="mt-2 text-sm text-critical">⚠ {error}</p>}
@@ -134,11 +148,14 @@ export function KeywordResearch() {
               <span className="font-medium text-ink tnum">{clusters}</span> topics ·{" "}
               <span className="font-medium text-ink tnum">{formatInt(totalVolume)}</span> combined
               monthly searches
-              {meta && (
+              {meta?.mode === "lookup" && (
                 <span className="text-muted">
                   {" "}
                   · {meta.newlyFetched} fetched, {meta.fromCache} from cache
                 </span>
+              )}
+              {meta?.mode === "suggest" && (
+                <span className="text-muted"> · {meta.discovered} ideas discovered, top shown</span>
               )}
             </span>
             <button
