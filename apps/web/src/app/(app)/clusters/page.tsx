@@ -18,6 +18,32 @@ export default async function ClustersPage({
     const siteId = scopeRaw.slice(5);
     real = real.filter((c) => c.siteId === siteId);
   }
+  const sortKey = typeof params.sort === "string" ? params.sort : "volume";
+  const sortDir = params.dir === "asc" ? 1 : -1;
+  const clusterValue = (c: (typeof real)[number]): number | string => {
+    switch (sortKey) {
+      case "cluster": return c.name;
+      case "variants": return c.members.length;
+      case "impressions": return c.impressions;
+      case "clicks": return c.clicks;
+      case "ctr": return c.impressions ? c.clicks / c.impressions : 0;
+      case "position": return c.position;
+      case "cpc": return c.cpc ?? -1;
+      default: return c.searchVolume ?? -1;
+    }
+  };
+  real = [...real].sort((a, b) => {
+    const va = clusterValue(a), vb = clusterValue(b);
+    const cmp = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
+    return cmp * sortDir;
+  });
+  const sortHref = (key: string) =>
+    `/clusters?${new URLSearchParams({
+      ...(scopeRaw ? { scope: scopeRaw } : {}),
+      sort: key,
+      dir: sortKey === key && sortDir === -1 ? "asc" : "desc",
+    }).toString()}`;
+  const arrow = (key: string) => (sortKey === key ? (sortDir === -1 ? " ▼" : " ▲") : "");
   if (real.length > 0) {
     return (
       <div>
@@ -29,15 +55,15 @@ export default async function ClustersPage({
           <table className="w-full text-left text-sm">
             <thead className="text-xs uppercase tracking-wide text-muted">
               <tr className="border-b border-edge">
-                <th className="px-4 py-2.5 font-medium">Cluster</th>
+                <th className="px-4 py-2.5 font-medium"><Link href={sortHref("cluster")} className="hover:text-ink">Cluster{arrow("cluster")}</Link></th>
                 <th className="px-4 py-2.5 font-medium">Site</th>
-                <th className="px-4 py-2.5 text-right font-medium">Variants</th>
-                <th className="px-4 py-2.5 text-right font-medium">Impr. (28d)</th>
-                <th className="px-4 py-2.5 text-right font-medium">Clicks</th>
-                <th className="px-4 py-2.5 text-right font-medium">CTR</th>
-                <th className="px-4 py-2.5 text-right font-medium">Avg pos.</th>
-                <th className="px-4 py-2.5 text-right font-medium">Volume/mo</th>
-                <th className="px-4 py-2.5 text-right font-medium">CPC</th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("variants")} className="hover:text-ink">Variants{arrow("variants")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("impressions")} className="hover:text-ink">Impr. (28d){arrow("impressions")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("clicks")} className="hover:text-ink">Clicks{arrow("clicks")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("ctr")} className="hover:text-ink">CTR{arrow("ctr")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("position")} className="hover:text-ink">Avg pos.{arrow("position")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("volume")} className="hover:text-ink">Volume/mo{arrow("volume")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("cpc")} className="hover:text-ink">CPC{arrow("cpc")}</Link></th>
               </tr>
             </thead>
             <tbody>

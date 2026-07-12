@@ -93,6 +93,30 @@ export function KeywordResearch() {
     URL.revokeObjectURL(a.href);
   }
 
+  type SortKey = "keyword" | "volume" | "trend" | "cpc" | "competition" | "yours";
+  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "volume", dir: -1 });
+  function toggleSort(key: SortKey) {
+    setSort((s) => (s.key === key ? { key, dir: s.dir === -1 ? 1 : -1 } : { key, dir: -1 }));
+  }
+  const sortedRows = useMemo(() => {
+    if (!rows) return null;
+    const value = (r: Row): number | string => {
+      switch (sort.key) {
+        case "keyword": return r.keyword;
+        case "volume": return r.searchVolume ?? -1;
+        case "trend": return trendPct(r.monthly) ?? -9999;
+        case "cpc": return r.cpc ?? -1;
+        case "competition": return r.competitionIndex ?? -1;
+        case "yours": return r.yourPosition === null ? 9999 : r.yourPosition;
+      }
+    };
+    return [...rows].sort((a, b) => {
+      const va = value(a), vb = value(b);
+      const cmp = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
+      return cmp * sort.dir;
+    });
+  }, [rows, sort]);
+
   const clusters = useMemo(() => {
     if (!rows) return 0;
     return new Set(rows.map((r) => r.cluster)).size;
@@ -168,16 +192,31 @@ export function KeywordResearch() {
           <table className="w-full text-left text-sm">
             <thead className="text-xs uppercase tracking-wide text-muted">
               <tr className="border-b border-edge">
-                <th className="px-4 py-2 font-medium">Keyword</th>
-                <th className="px-4 py-2 text-right font-medium">Volume/mo</th>
-                <th className="px-4 py-2 font-medium">12-month trend</th>
-                <th className="px-4 py-2 text-right font-medium">CPC</th>
-                <th className="px-4 py-2 font-medium">Competition</th>
-                <th className="px-4 py-2 font-medium">Your best site</th>
+                {(
+                  [
+                    ["keyword", "Keyword", "left"],
+                    ["volume", "Volume/mo", "right"],
+                    ["trend", "12-month trend", "left"],
+                    ["cpc", "CPC", "right"],
+                    ["competition", "Competition", "left"],
+                    ["yours", "Your best site", "left"],
+                  ] as const
+                ).map(([key, label, align]) => (
+                  <th key={key} className={`px-4 py-2 font-medium ${align === "right" ? "text-right" : ""}`}>
+                    <button
+                      onClick={() => toggleSort(key)}
+                      className="inline-flex items-center gap-1 uppercase tracking-wide hover:text-ink"
+                      title={`Sort by ${label}`}
+                    >
+                      {label}
+                      <span className="tnum">{sort.key === key ? (sort.dir === -1 ? "▼" : "▲") : ""}</span>
+                    </button>
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => {
+              {(sortedRows ?? rows).map((r) => {
                 const trend = trendPct(r.monthly);
                 const spark = r.monthly
                   ? [...r.monthly]
