@@ -1,7 +1,8 @@
 import { PageHeader, StatTile } from "@/components/ui";
 import { InboxClient } from "@/components/InboxClient";
 import { getOpportunities, getSites } from "@/lib/data";
-import { getRealSites } from "@/lib/data/real";
+import { getRealOpportunities, getRealSites } from "@/lib/data/real";
+import { RunAnalysisButton } from "@/components/RunAnalysisButton";
 import { Card } from "@/components/ui";
 import Link from "next/link";
 import { formatCompact, parseScope } from "@/lib/format";
@@ -13,15 +14,15 @@ export default async function InboxPage({
 }) {
   const params = await searchParams;
   const scope = parseScope(typeof params.scope === "string" ? params.scope : undefined);
-  const [opportunities, sites, realSites] = await Promise.all([
-    getOpportunities(scope),
-    getSites(),
-    getRealSites(),
-  ]);
+  const realSites = await getRealSites();
+  const realMode = realSites.length > 0;
+  const [opportunities, sites] = realMode
+    ? [await getRealOpportunities(), []]
+    : await Promise.all([getOpportunities(scope), getSites()]);
 
-  const sitesById = Object.fromEntries(
-    sites.map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain }]),
-  );
+  const sitesById = realMode
+    ? Object.fromEntries(realSites.map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain }]))
+    : Object.fromEntries(sites.map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain }]));
   const networkOpps = opportunities.filter((o) => o.type === "missing_dedicated_page");
   const totalUpside = opportunities.reduce((s, o) => s + o.estimatedClicksHigh, 0);
 
@@ -31,14 +32,16 @@ export default async function InboxPage({
         title="Opportunity Inbox"
         subtitle="Detected by deterministic rules, scored by network evidence — every card is fully explainable."
       />
-      {realSites.length > 0 && (
-        <Card className="mb-4 border-warning/50 p-3 text-sm text-ink-2">
-          These opportunity cards are <span className="font-medium text-ink">sample data</span>.
-          Your real Search Console data lives under{" "}
-          <Link href="/sites" className="font-medium text-series-1 hover:underline">
-            Sites
-          </Link>
-          ; the deterministic detectors that generate real opportunities arrive in Phase 4.
+      {realMode && (
+        <Card className="mb-4 flex flex-wrap items-center justify-between gap-2 p-3 text-sm text-ink-2">
+          <span>
+            Opportunities below are detected from your{" "}
+            <Link href="/sites" className="font-medium text-series-1 hover:underline">
+              real Search Console data
+            </Link>{" "}
+            and DataForSEO search volumes. Re-run after new imports.
+          </span>
+          <RunAnalysisButton />
         </Card>
       )}
       <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">

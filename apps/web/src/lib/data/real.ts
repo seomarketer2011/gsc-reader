@@ -3,7 +3,7 @@
 // to fixtures when no real site exists yet.
 
 import { getServerClient } from "@/lib/supabase/server";
-import { DailyPoint, PageStat } from "@/lib/types";
+import { DailyPoint, Opportunity, PageStat, QueryVariation } from "@/lib/types";
 
 export interface RealSite {
   id: string;
@@ -142,4 +142,49 @@ export async function hasImportedData(propertyId: string): Promise<boolean> {
     .select("date", { count: "exact", head: true })
     .eq("gsc_property_id", propertyId);
   return (count ?? 0) > 0;
+}
+
+/** Real detected opportunities for the caller's organisation (RLS-scoped). */
+export async function getRealOpportunities(): Promise<Opportunity[]> {
+  const supabase = await getServerClient();
+  if (!supabase) return [];
+  const { data } = await supabase
+    .from("opportunities")
+    .select("*, opportunity_evidence (payload)")
+    .eq("status", "open")
+    .order("score", { ascending: false });
+  return (data ?? []).map((r) => {
+    const evidence = (r.opportunity_evidence ?? []).flatMap(
+      (e: { payload: Array<Record<string, unknown>> }) => e.payload ?? [],
+    );
+    const evidenceQueries: QueryVariation[] = evidence
+      .filter((p: Record<string, unknown>) => p.query)
+      .map((p: Record<string, unknown>) => ({
+        query: String(p.query),
+        impressions28d: Number(p.impressions ?? p.impressions28d ?? 0),
+        clicks28d: Number(p.clicks ?? 0),
+        position: Number(p.position ?? 0),
+      }));
+    return {
+      id: r.id as string,
+      type: r.type,
+      title: r.title as string,
+      clusterId: null,
+      serviceId: null,
+      siteId: (r.site_id as string) ?? null,
+      networkImpressions: Number(r.network_impressions),
+      estimatedClicksLow: Number(r.est_clicks_low),
+      estimatedClicksHigh: Number(r.est_clicks_high),
+      commercialIntent: r.commercial_intent,
+      confidence: r.confidence,
+      effort: r.effort,
+      score: Number(r.score),
+      whatWeFound: r.what_we_found as string,
+      whyItMatters: r.why_it_matters as string,
+      proposedChange: r.proposed_change as string,
+      risks: (r.risks as string[]) ?? [],
+      sitePlans: [],
+      evidenceQueries,
+    } as Opportunity;
+  });
 }

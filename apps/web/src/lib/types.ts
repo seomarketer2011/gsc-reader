@@ -97,7 +97,8 @@ export type OpportunityType =
   | "title_mismatch"
   | "wrong_page_ranks"
   | "url_switching"
-  | "declining_clicks";
+  | "declining_clicks"
+  | "low_visibility";
 
 export type Level = "low" | "medium" | "high";
 

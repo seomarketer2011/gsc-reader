@@ -33,6 +33,7 @@ export const OPPORTUNITY_TYPE_LABEL: Record<OpportunityType, string> = {
   wrong_page_ranks: "Wrong page ranks",
   url_switching: "URL switching",
   declining_clicks: "Declining clicks",
+  low_visibility: "Low visibility vs demand",
 };
 
 export const LEVEL_LABEL: Record<Level, string> = {
