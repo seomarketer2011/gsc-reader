@@ -4,7 +4,7 @@ import { Badge, Card, EmptyState, PageHeader } from "@/components/ui";
 import { decryptToken, googleConfigured, GscProperty, listProperties, refreshAccessToken } from "@/lib/google/oauth";
 import { getServerClient } from "@/lib/supabase/server";
 import { hasImportedData } from "@/lib/data/real";
-import { ImportButton } from "@/components/ImportButton";
+import { PropertyTable } from "@/components/PropertyTable";
 
 export const dynamic = "force-dynamic";
 
@@ -149,44 +149,14 @@ export default async function ConnectionsPage({
                     This Google account has no Search Console properties.
                   </p>
                 ) : (
-                  <table className="w-full text-left text-sm">
-                    <thead className="text-xs uppercase tracking-wide text-muted">
-                      <tr className="border-b border-edge">
-                        <th className="px-4 py-2 font-medium">Property</th>
-                        <th className="px-4 py-2 font-medium">Permission</th>
-                        <th className="px-4 py-2 font-medium" />
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {props.map((p) => (
-                        <tr key={p.siteUrl} className="border-b border-edge last:border-0">
-                          <td className="px-4 py-2 text-ink">{p.siteUrl}</td>
-                          <td className="px-4 py-2 text-ink-2">{p.permissionLevel}</td>
-                          <td className="px-4 py-2 text-right">
-                            {trackedByUri.has(p.siteUrl) ? (
-                              <span className="inline-flex items-center gap-2">
-                                <Badge tone="good">tracked</Badge>
-                                <ImportButton
-                                  propertyId={trackedByUri.get(p.siteUrl)!}
-                                  alreadyImported={importedByProperty.get(trackedByUri.get(p.siteUrl)!) ?? false}
-                                />
-                              </span>
-                            ) : (
-                              <form action={trackProperty} className="inline">
-                                <input type="hidden" name="orgId" value={conn.organisation_id} />
-                                <input type="hidden" name="connectionId" value={conn.id} />
-                                <input type="hidden" name="siteUrl" value={p.siteUrl} />
-                                <input type="hidden" name="permission" value={p.permissionLevel} />
-                                <button className="rounded-md border border-edge px-2.5 py-1 font-medium text-series-1 hover:bg-page">
-                                  Track this property
-                                </button>
-                              </form>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  <PropertyTable
+                    properties={props}
+                    tracked={Object.fromEntries(trackedByUri)}
+                    imported={Object.fromEntries(importedByProperty)}
+                    orgId={conn.organisation_id}
+                    connectionId={conn.id}
+                    trackAction={trackProperty}
+                  />
                 )}
               </Card>
             );
