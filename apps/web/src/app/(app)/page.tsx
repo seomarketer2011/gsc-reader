@@ -16,9 +16,14 @@ export default async function InboxPage({
   const scope = parseScope(typeof params.scope === "string" ? params.scope : undefined);
   const realSites = await getRealSites();
   const realMode = realSites.length > 0;
-  const [opportunities, sites] = realMode
+  // eslint-disable-next-line prefer-const -- opportunities is refiltered below
+  let [opportunities, sites] = realMode
     ? [await getRealOpportunities(), []]
     : await Promise.all([getOpportunities(scope), getSites()]);
+  // Honour the global site selector in real mode.
+  if (realMode && scope.kind === "site") {
+    opportunities = opportunities.filter((o) => o.siteId === scope.id);
+  }
 
   const sitesById = realMode
     ? Object.fromEntries(realSites.map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain }]))
