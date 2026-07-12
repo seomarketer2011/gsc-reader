@@ -36,7 +36,29 @@ export default async function SitesPage({
         };
       }),
     );
-    rows.sort((a, b) => b.clicks - a.clicks);
+    const sortKey = typeof params.sort === "string" ? params.sort : "clicks";
+    const sortDir = params.dir === "asc" ? 1 : -1;
+    const rowValue = (r: (typeof rows)[number]): number | string => {
+      switch (sortKey) {
+        case "name": return r.site.name;
+        case "impressions": return r.impressions;
+        case "change": return r.changePct;
+        default: return r.clicks;
+      }
+    };
+    rows.sort((a, b) => {
+      const va = rowValue(a), vb = rowValue(b);
+      const cmp = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
+      return cmp * sortDir;
+    });
+    const sortHref = (key: string) =>
+      `/sites?${new URLSearchParams({
+        ...(scopeRaw ? { scope: scopeRaw } : {}),
+        ...(typeof params.range === "string" ? { range: params.range } : {}),
+        sort: key,
+        dir: sortKey === key && sortDir === -1 ? "asc" : "desc",
+      }).toString()}`;
+    const arrow = (key: string) => (sortKey === key ? (sortDir === -1 ? " ▼" : " ▲") : "");
     return (
       <div>
         <PageHeader
@@ -47,10 +69,10 @@ export default async function SitesPage({
           <table className="w-full text-left text-sm">
             <thead className="text-xs uppercase tracking-wide text-muted">
               <tr className="border-b border-edge">
-                <th className="px-4 py-2.5 font-medium">Site</th>
-                <th className="px-4 py-2.5 text-right font-medium">Clicks</th>
-                <th className="px-4 py-2.5 text-right font-medium">Impressions</th>
-                <th className="px-4 py-2.5 text-right font-medium">Δ vs prev</th>
+                <th className="px-4 py-2.5 font-medium"><Link href={sortHref("name")} className="hover:text-ink">Site{arrow("name")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("clicks")} className="hover:text-ink">Clicks{arrow("clicks")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("impressions")} className="hover:text-ink">Impressions{arrow("impressions")}</Link></th>
+                <th className="px-4 py-2.5 text-right font-medium"><Link href={sortHref("change")} className="hover:text-ink">Δ vs prev{arrow("change")}</Link></th>
                 <th className="px-4 py-2.5 font-medium">Trend</th>
               </tr>
             </thead>
