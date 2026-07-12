@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { GscProperty } from "@/lib/google/oauth";
 import { Badge } from "./ui";
 import { ImportButton } from "./ImportButton";
@@ -22,8 +23,13 @@ export function PropertyTable({
   connectionId: string;
   trackAction: (formData: FormData) => Promise<void>;
 }) {
+  const router = useRouter();
   const [query, setQuery] = useState("");
   const [onlyTracked, setOnlyTracked] = useState(false);
+  // Optimistic state: URIs tracked in this session, before the server
+  // round-trip delivers the refreshed props.
+  const [justTracked, setJustTracked] = useState<Set<string>>(new Set());
+  const [pending, setPending] = useState<string | null>(null);
 
   const sorted = useMemo(
     () => [...properties].sort((a, b) => a.siteUrl.localeCompare(b.siteUrl)),
@@ -85,14 +91,31 @@ export function PropertyTable({
                           alreadyImported={imported[propertyId] ?? false}
                         />
                       </span>
+                    ) : justTracked.has(p.siteUrl) ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Badge tone="good">tracked ✓</Badge>
+                        <span className="text-xs text-muted">updating…</span>
+                      </span>
                     ) : (
-                      <form action={trackAction} className="inline">
+                      <form
+                        action={async (fd: FormData) => {
+                          setPending(p.siteUrl);
+                          await trackAction(fd);
+                          setPending(null);
+                          setJustTracked((prev) => new Set(prev).add(p.siteUrl));
+                          router.refresh();
+                        }}
+                        className="inline"
+                      >
                         <input type="hidden" name="orgId" value={orgId} />
                         <input type="hidden" name="connectionId" value={connectionId} />
                         <input type="hidden" name="siteUrl" value={p.siteUrl} />
                         <input type="hidden" name="permission" value={p.permissionLevel} />
-                        <button className="rounded-md border border-edge px-2.5 py-1 font-medium text-series-1 hover:bg-page">
-                          Track this property
+                        <button
+                          disabled={pending === p.siteUrl}
+                          className="rounded-md border border-edge px-2.5 py-1 font-medium text-series-1 hover:bg-page disabled:opacity-50"
+                        >
+                          {pending === p.siteUrl ? "Tracking…" : "Track this property"}
                         </button>
                       </form>
                     )}
