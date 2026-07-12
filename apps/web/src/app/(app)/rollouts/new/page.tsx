@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { EmptyState, PageHeader } from "@/components/ui";
 import { RolloutBuilderClient } from "@/components/RolloutBuilderClient";
 import { getOpportunity, getSites, NotFoundError } from "@/lib/data";
+import { getRealOpportunities, getRealSites } from "@/lib/data/real";
 
 export default async function NewRolloutPage({
   searchParams,
@@ -21,12 +22,16 @@ export default async function NewRolloutPage({
     );
   }
 
-  let opportunity;
-  try {
-    opportunity = await getOpportunity(opportunityId);
-  } catch (e) {
-    if (e instanceof NotFoundError) notFound();
-    throw e;
+  // Real (database) opportunities first, then the fixture world.
+  let opportunity = (await getRealOpportunities()).find((o) => o.id === opportunityId) ?? null;
+  const isReal = opportunity !== null;
+  if (!opportunity) {
+    try {
+      opportunity = await getOpportunity(opportunityId);
+    } catch (e) {
+      if (e instanceof NotFoundError) notFound();
+      throw e;
+    }
   }
 
   if (opportunity.type !== "missing_dedicated_page") {
@@ -39,10 +44,16 @@ export default async function NewRolloutPage({
     );
   }
 
-  const sites = await getSites();
-  const sitesById = Object.fromEntries(
-    sites.map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain, location: s.location }]),
-  );
+  const sitesById = isReal
+    ? Object.fromEntries(
+        (await getRealSites()).map((s) => [
+          s.id,
+          { id: s.id, name: s.name, domain: s.domain, location: s.domain },
+        ]),
+      )
+    : Object.fromEntries(
+        (await getSites()).map((s) => [s.id, { id: s.id, name: s.name, domain: s.domain, location: s.location }]),
+      );
 
   return (
     <div>

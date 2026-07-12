@@ -13,13 +13,18 @@ export default async function SitesPage({
   const params = await searchParams;
 
   // Real Search Console data takes over as soon as a property is tracked.
-  const realSites = await getRealSites();
+  let realSites = await getRealSites();
+  const scopeRaw = typeof params.scope === "string" ? params.scope : "";
+  if (scopeRaw.startsWith("site:")) {
+    realSites = realSites.filter((s) => s.id === scopeRaw.slice(5));
+  }
+  const rangeDays = Math.min(Number(params.range ?? 28) || 28, 180);
   if (realSites.length > 0) {
     const rows = await Promise.all(
       realSites.map(async (site) => {
-        const series = await getRealDailySeries(site.propertyId, 56);
-        const last28 = series.slice(-28);
-        const prev28 = series.slice(0, 28);
+        const series = await getRealDailySeries(site.propertyId, rangeDays * 2);
+        const last28 = series.slice(-rangeDays);
+        const prev28 = series.slice(0, rangeDays);
         const clicks = last28.reduce((sum, p) => sum + p.clicks, 0);
         const prevClicks = prev28.reduce((sum, p) => sum + p.clicks, 0);
         return {
@@ -36,7 +41,7 @@ export default async function SitesPage({
       <div>
         <PageHeader
           title="Sites"
-          subtitle={`${rows.length} tracked ${rows.length === 1 ? "property" : "properties"} · real Search Console data · last 28 days`}
+          subtitle={`${rows.length} tracked ${rows.length === 1 ? "property" : "properties"} · real Search Console data · last ${rangeDays} days`}
         />
         <Card className="overflow-x-auto">
           <table className="w-full text-left text-sm">
@@ -46,7 +51,7 @@ export default async function SitesPage({
                 <th className="px-4 py-2.5 text-right font-medium">Clicks</th>
                 <th className="px-4 py-2.5 text-right font-medium">Impressions</th>
                 <th className="px-4 py-2.5 text-right font-medium">Δ vs prev</th>
-                <th className="px-4 py-2.5 font-medium">Trend (28d)</th>
+                <th className="px-4 py-2.5 font-medium">Trend</th>
               </tr>
             </thead>
             <tbody>

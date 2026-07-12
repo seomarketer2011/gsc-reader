@@ -113,7 +113,7 @@ export function OpportunityCard({
           </Link>
         )}
         <button
-          onClick={() => onDismiss(opp.id)}
+          onClick={() => onDismiss(opp.dismissKey ?? opp.id)}
           className="ml-auto rounded-md px-2.5 py-1 font-medium text-muted hover:bg-page hover:text-ink"
         >
           Dismiss

@@ -110,6 +110,8 @@ export interface SitePlan {
 
 export interface Opportunity {
   id: string;
+  /** Stable identity across analysis runs (real opportunities get new ids each run). */
+  dismissKey?: string;
   type: OpportunityType;
   title: string;
   clusterId: string | null;

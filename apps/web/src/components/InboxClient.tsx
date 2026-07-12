@@ -44,7 +44,7 @@ export function InboxClient({
   const visible = useMemo(
     () =>
       opportunities.filter((o) => {
-        if (dismissedIds.has(o.id)) return false;
+        if (dismissedIds.has(o.dismissKey ?? o.id)) return false;
         if (typeFilter && o.type !== typeFilter) return false;
         if (confidenceFilter && o.confidence !== confidenceFilter) return false;
         if (o.networkImpressions < minImpressions) return false;

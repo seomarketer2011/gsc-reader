@@ -168,6 +168,7 @@ export async function getRealOpportunities(): Promise<Opportunity[]> {
       }));
     return {
       id: r.id as string,
+      dismissKey: `${r.type}|${r.site_id ?? "org"}|${r.title}`,
       type: r.type,
       title: r.title as string,
       clusterId: null,
