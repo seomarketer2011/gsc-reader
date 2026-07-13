@@ -22,36 +22,38 @@ Next.js + TypeScript in `apps/web`, no external services, no credentials.
 **Done when:** `npm run build` and `npm test` pass; every screen renders with
 realistic data; recommendations show full evidence.
 
-## Phase 2 — Supabase application database  ← current phase
+## Phase 2 — Supabase application database  ✅ built (auth, orgs, synced user state)
 
 Schema migrations for the tables in `docs/DATA_MODEL.md`; auth (login,
 organisations, membership); saved filters and recommendation status move from
 fixtures to Postgres. Every schema change is a migration.
 
-## Phase 3 — One Search Console property
+## Phase 3 — One Search Console property  ✅ built (single & multi-property)
 
 Google OAuth (read-only scope) → list accessible properties → select one →
 import 16 months of history via daily requests → display real pages and queries.
 Tested end-to-end with a single website before any bulk onboarding.
 
-## Phase 4 — First opportunity detectors
+## Phase 4 — First opportunity detectors  ✅ built (+ DataForSEO low-visibility detector)
 
 The seven rule-based detectors in `docs/OPPORTUNITY_RULES.md`, running on the
 imported property. Deterministic, unit-tested; no LLM in the decision path.
 
-## Phase 5 — Networks and pooled analysis
+## Phase 5 — Networks and pooled analysis  ✅ built (clustering, coverage matrix, network rollouts)
 
 Shared service taxonomy · location normalisation · cross-site query clustering ·
 site-topic coverage matrix on real data · dedicated-page vs missing-page
 comparisons · network rollout recommendations.
 
-## Phase 6 — BigQuery and daily jobs
+## Phase 6 — Daily jobs  ✅ (nightly Cloudflare cron) · ⏳ BigQuery move still pending
 
-Raw performance data moves to BigQuery (partitioned/clustered per
-`docs/ARCHITECTURE.md`); Cloud Run Jobs + Cloud Scheduler for nightly imports
-and summary refreshes; recommendations and application state stay in Postgres.
+Daily refresh is **done** as a Cloudflare Worker cron (03:30 UTC) that tops up
+the last few days per property and re-runs all detectors (see `OPERATIONS.md`
+§7). Still **pending**: moving raw performance rows from Postgres to BigQuery
+(partitioned/clustered per `docs/ARCHITECTURE.md`) before the Postgres size cap
+bites; application state stays in Postgres.
 
-## Phase 7 — Crawler and AI explanations
+## Phase 7 — Crawler and AI explanations  ⏳ not started
 
 Page crawler (titles, H1s, headings, content, internal links, canonicals,
 indexability, similarity) feeding cannibalisation/content-gap analysis; LLM
@@ -60,8 +62,10 @@ engine.
 
 ## Later
 
-Data Explorer (pivot builder) · GA4/CRM commercial prioritisation · experiment
-tracking and the learning loop.
+Standalone **Keyword research** (paste list → volumes/CPC/competition/12-month
+trend + idea discovery, cross-referenced against own rankings) is **built**.
+Still later: Data Explorer (pivot builder) · GA4/CRM commercial prioritisation ·
+experiment tracking and the learning loop.
 
 ## Standing rules for every phase
 
