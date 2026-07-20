@@ -64,20 +64,31 @@ export async function runDetectors(
   if (rows.length === 0) return 0;
 
   // Aggregate per query (and track pages + recency alongside).
-  interface Agg { clicks: number; impressions: number; posSum: number; days: number; pages: Map<string, number> }
+  interface PageAgg { impressions: number; clicks: number; posSum: number; days: number }
+  interface Agg { clicks: number; impressions: number; posSum: number; days: number; recentClicks: number; prevClicks: number; pages: Map<string, PageAgg> }
   const byQuery = new Map<string, Agg>();
   const recent = { clicks: 0, prevClicks: 0 };
   const midpoint = since(14);
   for (const r of rows) {
-    const agg = byQuery.get(r.query as string) ?? { clicks: 0, impressions: 0, posSum: 0, days: 0, pages: new Map() };
+    const agg = byQuery.get(r.query as string) ?? { clicks: 0, impressions: 0, posSum: 0, days: 0, recentClicks: 0, prevClicks: 0, pages: new Map() };
     agg.clicks += Number(r.clicks);
     agg.impressions += Number(r.impressions);
     agg.posSum += Number(r.position);
     agg.days++;
-    agg.pages.set(r.page as string, (agg.pages.get(r.page as string) ?? 0) + Number(r.impressions));
+    const page = agg.pages.get(r.page as string) ?? { impressions: 0, clicks: 0, posSum: 0, days: 0 };
+    page.impressions += Number(r.impressions);
+    page.clicks += Number(r.clicks);
+    page.posSum += Number(r.position);
+    page.days++;
+    agg.pages.set(r.page as string, page);
     byQuery.set(r.query as string, agg);
-    if ((r.date as string) >= midpoint) recent.clicks += Number(r.clicks);
-    else recent.prevClicks += Number(r.clicks);
+    if ((r.date as string) >= midpoint) {
+      recent.clicks += Number(r.clicks);
+      agg.recentClicks += Number(r.clicks);
+    } else {
+      recent.prevClicks += Number(r.clicks);
+      agg.prevClicks += Number(r.clicks);
+    }
   }
 
   // Cluster the queries (org domains supply extra location tokens).
@@ -95,12 +106,19 @@ export async function runDetectors(
   const confidence = daysOfData >= 25 ? "high" : daysOfData >= 12 ? "medium" : "low";
   const domain = property.property_uri.replace(/^sc-domain:/, "");
   const topPageFor = (c: QueryClusterAgg) => {
-    const pages = new Map<string, number>();
+    const pages = new Map<string, PageAgg>();
     for (const m of c.members) {
       const agg = byQuery.get(m.query);
-      for (const [page, impr] of agg?.pages ?? []) pages.set(page, (pages.get(page) ?? 0) + impr);
+      for (const [page, p] of agg?.pages ?? []) {
+        const t = pages.get(page) ?? { impressions: 0, clicks: 0, posSum: 0, days: 0 };
+        t.impressions += p.impressions;
+        t.clicks += p.clicks;
+        t.posSum += p.posSum;
+        t.days += p.days;
+        pages.set(page, t);
+      }
     }
-    return [...pages.entries()].sort((a, b) => b[1] - a[1]);
+    return [...pages.entries()].sort((a, b) => b[1].impressions - a[1].impressions);
   };
   const found: DetectedOpportunity[] = [];
 
@@ -151,7 +169,7 @@ export async function runDetectors(
     }
 
     // 3. Internal competition: impressions for one cluster split across pages.
-    const significant = pages.filter(([, impr]) => impr >= 15);
+    const significant = pages.filter(([, p]) => p.impressions >= 15);
     if (significant.length >= 2 && c.impressions >= 30) {
       found.push({
         type: "url_switching",
@@ -167,7 +185,13 @@ export async function runDetectors(
         whyItMatters: "Internal competition splits ranking signals; consolidating usually lifts the winner several positions.",
         proposedChange: "Pick the canonical page, merge overlapping content, and de-optimise or redirect the competitor.",
         risks: ["Redirecting the wrong page can lose long-tail rankings — check each page's full query set first"],
-        evidence: significant.map(([page, impr]) => ({ query: c.name, page, impressions: impr })),
+        evidence: significant.map(([page, p]) => ({
+          query: c.name,
+          page,
+          impressions: p.impressions,
+          clicks: p.clicks,
+          position: p.days ? Math.round((p.posSum / p.days) * 10) / 10 : 0,
+        })),
       });
     }
   }
@@ -176,6 +200,18 @@ export async function runDetectors(
   if (daysOfData >= 24 && recent.prevClicks >= 10) {
     const drop = (recent.prevClicks - recent.clicks) / recent.prevClicks;
     if (drop >= 0.3) {
+      const decliners = [...byQuery.entries()]
+        .filter(([, a]) => a.prevClicks > a.recentClicks)
+        .sort((x, y) => (y[1].prevClicks - y[1].recentClicks) - (x[1].prevClicks - x[1].recentClicks))
+        .slice(0, 8)
+        .map(([query, a]) => ({
+          query,
+          impressions: a.impressions,
+          clicks: a.clicks,
+          position: a.days ? Math.round((a.posSum / a.days) * 10) / 10 : 0,
+          clicksPrev14d: a.prevClicks,
+          clicksLatest14d: a.recentClicks,
+        }));
       found.push({
         type: "declining_clicks",
         title: `${domain} clicks are down ${(drop * 100).toFixed(0)}% fortnight-on-fortnight`,
@@ -188,9 +224,9 @@ export async function runDetectors(
         effort: "medium",
         whatWeFound: `Clicks fell from ${recent.prevClicks} to ${recent.clicks} across the last two 14-day windows.`,
         whyItMatters: "Decay usually precedes a larger ranking loss; early refresh is cheap.",
-        proposedChange: "Identify the declining queries, refresh their pages and re-validate internal links.",
+        proposedChange: "Refresh the pages behind the declining queries listed in the evidence and re-validate internal links.",
         risks: [],
-        evidence: [{ previous14d: recent.prevClicks, latest14d: recent.clicks }],
+        evidence: [{ previous14d: recent.prevClicks, latest14d: recent.clicks }, ...decliners],
       });
     }
   }
@@ -227,7 +263,7 @@ export async function runDetectors(
         proposedChange: `Build out dedicated, locally-detailed content targeting “${c.name}” and its variants.`,
         risks: ["Volume is market-wide; local share depends on service area"],
         evidence: [
-          { query: c.name, searchVolume: volume, cpc, impressions28d: c.impressions, position: c.position },
+          { query: c.name, searchVolume: volume, cpc, impressions28d: c.impressions, clicks: c.clicks, position: Math.round(c.position * 10) / 10 },
           ...memberEvidence(c),
         ],
       });

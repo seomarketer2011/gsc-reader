@@ -20,6 +20,8 @@ export function OpportunityCard({
   const isNetwork = opp.type === "missing_dedicated_page";
   const affected = opp.sitePlans.filter((p) => p.action !== "exclude");
   const site = opp.siteId ? sitesById[opp.siteId] : null;
+  const hasPages = opp.evidenceQueries.some((q) => q.page);
+  const hasSites = opp.evidenceQueries.some((q) => q.site);
 
   return (
     <Card className="p-4">
@@ -126,15 +128,42 @@ export function OpportunityCard({
             <thead className="text-xs uppercase tracking-wide text-muted">
               <tr className="border-b border-edge">
                 <th className="px-3 py-2 font-medium">Query</th>
+                {hasPages && <th className="px-3 py-2 font-medium">Page</th>}
+                {hasSites && <th className="px-3 py-2 font-medium">Site</th>}
                 <th className="px-3 py-2 text-right font-medium">Impressions</th>
                 <th className="px-3 py-2 text-right font-medium">Clicks</th>
                 <th className="px-3 py-2 text-right font-medium">Position</th>
               </tr>
             </thead>
             <tbody>
-              {opp.evidenceQueries.map((q) => (
-                <tr key={q.query} className="border-b border-edge last:border-0">
+              {opp.evidenceQueries.map((q, i) => (
+                <tr
+                  key={`${q.query}|${q.page ?? ""}|${q.site ?? ""}|${i}`}
+                  className="border-b border-edge last:border-0"
+                >
                   <td className="px-3 py-1.5 text-ink">{q.query}</td>
+                  {hasPages && (
+                    <td className="max-w-72 px-3 py-1.5">
+                      {q.page ? (
+                        <a
+                          href={q.page}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={q.page}
+                          className="break-all text-ink-2 hover:text-series-1"
+                        >
+                          {q.page.replace(/^https?:\/\/(www\.)?/, "")}
+                        </a>
+                      ) : (
+                        <span className="text-muted">—</span>
+                      )}
+                    </td>
+                  )}
+                  {hasSites && (
+                    <td className="px-3 py-1.5 text-ink-2">
+                      {q.site ?? <span className="text-muted">—</span>}
+                    </td>
+                  )}
                   <td className="px-3 py-1.5 text-right text-ink-2 tnum">
                     {formatInt(q.impressions28d)}
                   </td>
@@ -146,7 +175,10 @@ export function OpportunityCard({
               ))}
               {opp.evidenceQueries.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="px-3 py-2 text-ink-2">
+                  <td
+                    colSpan={4 + (hasPages ? 1 : 0) + (hasSites ? 1 : 0)}
+                    className="px-3 py-2 text-ink-2"
+                  >
                     Evidence for this detector lives on the site screen.
                   </td>
                 </tr>

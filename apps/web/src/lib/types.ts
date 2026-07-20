@@ -63,6 +63,10 @@ export interface QueryVariation {
   impressions28d: number;
   clicks28d: number;
   position: number;
+  /** Set on evidence rows that are about a specific URL (e.g. url_switching). */
+  page?: string | null;
+  /** Set on network evidence rows that are about a specific site's domain. */
+  site?: string | null;
 }
 
 export interface QueryCluster {

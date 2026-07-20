@@ -165,6 +165,8 @@ export async function getRealOpportunities(): Promise<Opportunity[]> {
         impressions28d: Number(p.impressions ?? p.impressions28d ?? 0),
         clicks28d: Number(p.clicks ?? 0),
         position: Number(p.position ?? 0),
+        page: p.page ? String(p.page) : null,
+        site: p.site ? String(p.site) : null,
       }));
     return {
       id: r.id as string,
