@@ -4,7 +4,7 @@
 truth for what this app is, where everything lives, how to run and deploy it,
 and how to operate it day to day. It assumes no prior context.
 
-Last updated: 2026-07-12.
+Last updated: 2026-07-20.
 
 ---
 
@@ -32,7 +32,7 @@ data currently lives in Postgres, not BigQuery (see §9 Known limitations).
 
 | Thing | Value / location | Notes |
 | --- | --- | --- |
-| **Git repo** | `github.com/seomarketer2011/gsc-reader` | Active branch: `claude/app-architecture-setup-vhuqql`. No PR opened yet — see §11. |
+| **Git repo** | `github.com/seomarketer2011/gsc-reader` | Active branch: `main` (all earlier `claude/*` work branches are merged into it). |
 | **Hosting** | Cloudflare Workers, account `Seomarketer2011@yahoo.co.uk` (id `44799b719f2192a9f066f425aaff3106`) | Worker name `gsc-reader`. Paid Workers plan ($5/mo). Account id is pinned in `apps/web/wrangler.jsonc`. |
 | **Database + auth** | Supabase project `hlqmeuxaigjjenrupmuv` ("GSC Easy Wins") | URL `https://hlqmeuxaigjjenrupmuv.supabase.co`. Currently free tier — see §9/§10. |
 | **Search volumes** | DataForSEO account `pauldanielstone@gmail.com` | Pay-as-you-go balance. Google Ads endpoints. |
@@ -265,11 +265,11 @@ Not yet built (from `docs/IMPLEMENTATION_PLAN.md` and product spec):
   (track recommendation → implementation → actual gain).
 - Automated migrations/CI, and property-list caching on the Connections page.
 
-**Housekeeping:** the work is all on branch
-`claude/app-architecture-setup-vhuqql`; no PR has been opened. Consider opening
-one to merge into the default branch. Cloudflare deploys currently build from
+**Housekeeping:** all work now lives on `main`; the earlier `claude/*` work
+branches are merged into it and can be deleted (make `main` the default branch
+in GitHub → Settings → Branches first). Cloudflare deploys currently build from
 whatever branch is deployed by hand — if you connect Cloudflare↔GitHub for
-auto-deploy, point it at the branch you settle on.
+auto-deploy, point it at `main`.
 
 **Security note:** the Supabase secret key and DataForSEO password were shared in
 a chat during setup. Best practice is to rotate both once handover is complete
