@@ -161,7 +161,9 @@ export async function getRealOpportunities(): Promise<Opportunity[]> {
     const evidenceQueries: QueryVariation[] = evidence
       .filter((p: Record<string, unknown>) => p.query)
       .map((p: Record<string, unknown>) => ({
-        query: String(p.query),
+        // Cluster-level summary rows (they carry searchVolume) share the top
+        // variant's wording — label them so they don't read as duplicates.
+        query: p.searchVolume != null ? `${p.query} — all variants (total)` : String(p.query),
         impressions28d: Number(p.impressions ?? p.impressions28d ?? 0),
         clicks28d: Number(p.clicks ?? 0),
         position: Number(p.position ?? 0),
