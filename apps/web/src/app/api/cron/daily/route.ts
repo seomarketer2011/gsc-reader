@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { importRecentDays } from "@/lib/google/import";
 import { runDetectors } from "@/lib/engine/detect";
-import { detectNetworkOpportunities } from "@/lib/engine/network";
+import { runNetworkAnalysis } from "@/lib/engine/network";
 import { getServiceClient } from "@/lib/supabase/server";
 
 export const maxDuration = 300;
@@ -63,7 +63,7 @@ export async function POST(request: NextRequest) {
   }
   for (const orgId of orgIds) {
     try {
-      summary[`network:${orgId.slice(0, 8)}`] = `${await detectNetworkOpportunities(service, { id: orgId })} rollouts`;
+      summary[`network:${orgId.slice(0, 8)}`] = `${await runNetworkAnalysis(service, orgId)} rollouts`;
     } catch (e) {
       summary[`network:${orgId.slice(0, 8)}`] = e instanceof Error ? e.message.slice(0, 120) : "failed";
     }

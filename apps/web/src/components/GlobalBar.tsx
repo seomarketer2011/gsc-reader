@@ -43,7 +43,7 @@ export function GlobalBar({
           aria-label="Analysis scope"
         >
           <option value="">{network.name}</option>
-          <optgroup label="Campaigns">
+          <optgroup label="Groups">
             {campaigns.map((c) => (
               <option key={c.id} value={`campaign:${c.id}`}>
                 {c.name}

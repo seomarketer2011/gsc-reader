@@ -1,8 +1,15 @@
 import Link from "next/link";
 import { revalidatePath } from "next/cache";
 import { Badge, Card, EmptyState, PageHeader } from "@/components/ui";
-import { decryptToken, googleConfigured, GscProperty, listProperties, refreshAccessToken } from "@/lib/google/oauth";
-import { getServerClient } from "@/lib/supabase/server";
+import {
+  decryptToken,
+  googleConfigured,
+  GscProperty,
+  listProperties,
+  refreshAccessToken,
+  TokenRefreshError,
+} from "@/lib/google/oauth";
+import { getServerClient, getServiceClient } from "@/lib/supabase/server";
 import { hasImportedData } from "@/lib/data/real";
 import { PropertyTable } from "@/components/PropertyTable";
 
@@ -82,13 +89,24 @@ export default async function ConnectionsPage({
 
   // Live property list per active connection.
   const propertiesByConnection = new Map<string, GscProperty[] | { error: string }>();
+  const needsReconnect = new Set<string>();
   for (const conn of (connections ?? []) as ConnectionRow[]) {
     if (conn.status !== "active" || !conn.refresh_token_encrypted) continue;
     try {
       const accessToken = await refreshAccessToken(await decryptToken(conn.refresh_token_encrypted));
       propertiesByConnection.set(conn.id, await listProperties(accessToken));
     } catch (e) {
-      propertiesByConnection.set(conn.id, { error: e instanceof Error ? e.message : "failed" });
+      if (e instanceof TokenRefreshError && e.invalidGrant) {
+        // Google revoked the refresh token — only reconnecting can fix it.
+        // Persist so imports and future loads stop retrying a dead token.
+        needsReconnect.add(conn.id);
+        await getServiceClient()
+          ?.from("google_connections")
+          .update({ status: "revoked" })
+          .eq("id", conn.id);
+      } else {
+        propertiesByConnection.set(conn.id, { error: e instanceof Error ? e.message : "failed" });
+      }
     }
   }
 
@@ -132,13 +150,35 @@ export default async function ConnectionsPage({
         <div className="space-y-4">
           {(connections as ConnectionRow[]).map((conn) => {
             const props = propertiesByConnection.get(conn.id);
+            const reconnect = needsReconnect.has(conn.id) || conn.status !== "active";
             return (
               <Card key={conn.id}>
                 <div className="flex items-center justify-between border-b border-edge px-4 py-2.5">
                   <div className="text-sm font-medium text-ink">{conn.google_account_email}</div>
-                  <Badge tone={conn.status === "active" ? "good" : "critical"}>{conn.status}</Badge>
+                  <Badge tone={reconnect ? "critical" : "good"}>
+                    {reconnect ? "reconnect needed" : conn.status}
+                  </Badge>
                 </div>
-                {!props ? (
+                {reconnect ? (
+                  <div className="px-4 py-4 text-sm">
+                    <p className="text-ink-2">
+                      Google no longer accepts the saved sign-in for this account, so its
+                      properties can&rsquo;t be listed or imported. This happens when access is
+                      revoked in the Google account&rsquo;s security settings, the password
+                      changes, or the token expires.
+                    </p>
+                    <Link
+                      href="/api/google/start"
+                      className="mt-3 inline-block rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90"
+                    >
+                      Reconnect {conn.google_account_email}
+                    </Link>
+                    <p className="mt-2 text-xs text-muted">
+                      Sign in with the same Google account — the connection is restored in place
+                      and all imported data is kept.
+                    </p>
+                  </div>
+                ) : !props ? (
                   <p className="px-4 py-4 text-sm text-ink-2">Connection inactive.</p>
                 ) : "error" in props ? (
                   <p className="px-4 py-4 text-sm text-critical">

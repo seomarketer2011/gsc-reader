@@ -1,7 +1,7 @@
 import { PageHeader, StatTile } from "@/components/ui";
 import { InboxClient } from "@/components/InboxClient";
 import { getOpportunities, getSites } from "@/lib/data";
-import { getRealOpportunities, getRealSites } from "@/lib/data/real";
+import { getRealOpportunities, getRealScopeSiteIds, getRealSites } from "@/lib/data/real";
 import { RunAnalysisButton } from "@/components/RunAnalysisButton";
 import { Card } from "@/components/ui";
 import Link from "next/link";
@@ -20,9 +20,16 @@ export default async function InboxPage({
   let [opportunities, sites] = realMode
     ? [await getRealOpportunities(), []]
     : await Promise.all([getOpportunities(scope), getSites()]);
-  // Honour the global site selector in real mode.
-  if (realMode && scope.kind === "site") {
-    opportunities = opportunities.filter((o) => o.siteId === scope.id);
+  // Honour the global site/group selector in real mode.
+  if (realMode && scope.kind !== "network") {
+    const scopedIds = await getRealScopeSiteIds(`${scope.kind}:${scope.id}`);
+    const idSet = new Set(scopedIds ?? []);
+    opportunities = opportunities.filter((o) =>
+      o.siteId
+        ? idSet.has(o.siteId)
+        : // Network rollout cards stay visible if any in-scope site is affected.
+          o.sitePlans.some((p) => p.action !== "exclude" && idSet.has(p.siteId)),
+    );
   }
 
   const sitesById = realMode

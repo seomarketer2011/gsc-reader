@@ -44,6 +44,21 @@ export async function exchangeCode(origin: string, code: string): Promise<TokenR
   return res.json();
 }
 
+export class TokenRefreshError extends Error {
+  /**
+   * Google returns invalid_grant when the refresh token itself is dead —
+   * access revoked in the Google account, password changed, or the token
+   * expired (OAuth apps in "Testing" status get 7-day tokens). The only
+   * remedy is reconnecting; retrying is pointless.
+   */
+  readonly invalidGrant: boolean;
+
+  constructor(status: number, body: string) {
+    super(`Token refresh failed (${status}): ${body}`);
+    this.invalidGrant = body.includes("invalid_grant");
+  }
+}
+
 export async function refreshAccessToken(refreshToken: string): Promise<string> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -55,7 +70,7 @@ export async function refreshAccessToken(refreshToken: string): Promise<string> 
       refresh_token: refreshToken,
     }),
   });
-  if (!res.ok) throw new Error(`Token refresh failed (${res.status}): ${await res.text()}`);
+  if (!res.ok) throw new TokenRefreshError(res.status, await res.text());
   const data = (await res.json()) as TokenResponse;
   return data.access_token;
 }
