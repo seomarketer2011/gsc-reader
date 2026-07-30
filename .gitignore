@@ -20,7 +20,11 @@ build/
 npm-debug.log*
 .turbo/
 .cache/
-coverage/
+# Test-coverage output only — anchored so app routes named "coverage" aren't ignored
+/coverage/
+apps/*/coverage/
+packages/*/coverage/
+services/*/coverage/
 
 # OS / editor
 .DS_Store
