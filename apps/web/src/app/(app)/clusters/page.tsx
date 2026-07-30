@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Badge, Card, PageHeader } from "@/components/ui";
 import { getClusters, getServices } from "@/lib/data";
-import { getRealClusters } from "@/lib/data/real";
+import { getRealClusters, getRealScopeSiteIds } from "@/lib/data/real";
 import { formatPct } from "@/lib/format";
 import { formatInt } from "@/lib/format";
 
@@ -13,10 +13,12 @@ export default async function ClustersPage({
   const params = await searchParams;
   const scopeRaw = typeof params.scope === "string" ? params.scope : "";
   let real = await getRealClusters();
-  // Honour the global site selector.
-  if (scopeRaw.startsWith("site:")) {
-    const siteId = scopeRaw.slice(5);
-    real = real.filter((c) => c.siteId === siteId);
+  const realMode = real.length > 0;
+  // Honour the global site/group selector.
+  const scopedIds = await getRealScopeSiteIds(scopeRaw || undefined);
+  if (scopedIds) {
+    const idSet = new Set(scopedIds);
+    real = real.filter((c) => idSet.has(c.siteId));
   }
   const sortKey = typeof params.sort === "string" ? params.sort : "volume";
   const sortDir = params.dir === "asc" ? 1 : -1;
@@ -44,6 +46,19 @@ export default async function ClustersPage({
       dir: sortKey === key && sortDir === -1 ? "asc" : "desc",
     }).toString()}`;
   const arrow = (key: string) => (sortKey === key ? (sortDir === -1 ? " ▼" : " ▲") : "");
+  if (realMode && real.length === 0) {
+    return (
+      <div>
+        <PageHeader
+          title="Query clusters"
+          subtitle="Wording variants merged into topics — real Search Console data with cached DataForSEO volumes."
+        />
+        <Card className="p-4 text-sm text-ink-2">
+          No clusters in this scope yet — the selected group has no sites with imported data.
+        </Card>
+      </div>
+    );
+  }
   if (real.length > 0) {
     return (
       <div>

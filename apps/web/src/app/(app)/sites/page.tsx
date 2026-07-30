@@ -1,9 +1,166 @@
 import Link from "next/link";
+import { revalidatePath } from "next/cache";
 import { Card, EmptyState, PageHeader } from "@/components/ui";
 import { Sparkline } from "@/components/charts";
 import { getScopedSiteIds, getSiteDailySeries, getSites } from "@/lib/data";
-import { getRealDailySeries, getRealSites } from "@/lib/data/real";
+import {
+  getRealDailySeries,
+  getRealGroups,
+  getRealScopeSiteIds,
+  getRealSites,
+  RealGroup,
+  RealSite,
+} from "@/lib/data/real";
+import { getServerClient } from "@/lib/supabase/server";
 import { formatInt, parseScope } from "@/lib/format";
+
+async function callerOrgId() {
+  const supabase = await getServerClient();
+  if (!supabase) return null;
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData.user) return null;
+  const { data: membership } = await supabase
+    .from("organisation_users")
+    .select("organisation_id")
+    .eq("user_id", userData.user.id)
+    .limit(1)
+    .maybeSingle();
+  return membership ? { supabase, orgId: membership.organisation_id as string } : null;
+}
+
+async function createGroup(formData: FormData) {
+  "use server";
+  const caller = await callerOrgId();
+  const name = String(formData.get("name") ?? "").trim();
+  const siteIds = formData.getAll("site").map(String);
+  if (!caller || !name) return;
+  const { data: group } = await caller.supabase
+    .from("campaigns")
+    .insert({ organisation_id: caller.orgId, name })
+    .select("id")
+    .single();
+  if (group && siteIds.length > 0) {
+    await caller.supabase.from("campaign_sites").insert(
+      siteIds.map((siteId) => ({
+        organisation_id: caller.orgId,
+        campaign_id: group.id,
+        site_id: siteId,
+      })),
+    );
+  }
+  revalidatePath("/", "layout"); // group list feeds the global View selector
+}
+
+async function saveGroupMembers(formData: FormData) {
+  "use server";
+  const caller = await callerOrgId();
+  const groupId = String(formData.get("groupId") ?? "");
+  const siteIds = formData.getAll("site").map(String);
+  if (!caller || !groupId) return;
+  // RLS restricts both statements to the caller's organisation.
+  await caller.supabase.from("campaign_sites").delete().eq("campaign_id", groupId);
+  if (siteIds.length > 0) {
+    await caller.supabase.from("campaign_sites").insert(
+      siteIds.map((siteId) => ({
+        organisation_id: caller.orgId,
+        campaign_id: groupId,
+        site_id: siteId,
+      })),
+    );
+  }
+  revalidatePath("/", "layout");
+}
+
+async function deleteGroup(formData: FormData) {
+  "use server";
+  const caller = await callerOrgId();
+  const groupId = String(formData.get("groupId") ?? "");
+  if (!caller || !groupId) return;
+  await caller.supabase.from("campaigns").delete().eq("id", groupId);
+  revalidatePath("/", "layout");
+}
+
+function SiteCheckboxes({ sites, checked }: { sites: RealSite[]; checked?: Set<string> }) {
+  return (
+    <div className="grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+      {sites.map((site) => (
+        <label key={site.id} className="flex items-center gap-2 text-sm text-ink-2">
+          <input
+            type="checkbox"
+            name="site"
+            value={site.id}
+            defaultChecked={checked?.has(site.id) ?? false}
+            className="accent-[var(--series-1)]"
+          />
+          <span className="truncate" title={site.domain}>
+            {site.name}
+          </span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function GroupManager({ groups, sites }: { groups: RealGroup[]; sites: RealSite[] }) {
+  const button =
+    "rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90";
+  return (
+    <div className="mt-6">
+      <h2 className="mb-1 text-base font-semibold text-ink">Site groups</h2>
+      <p className="mb-3 text-sm text-ink-2">
+        Group sites by industry (e.g. locksmiths, electricians) to compare and analyse them
+        together. Pick a group in the View selector above to scope every screen to it; the
+        analysis run pools content-gap detection within each group only.
+      </p>
+      <div className="space-y-4">
+        {groups.map((group) => (
+          <Card key={group.id} className="p-4">
+            <form action={saveGroupMembers}>
+              <input type="hidden" name="groupId" value={group.id} />
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <div className="text-sm font-medium text-ink">
+                  {group.name}
+                  <span className="ml-2 text-xs font-normal text-muted">
+                    {group.siteIds.length} {group.siteIds.length === 1 ? "site" : "sites"}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <button type="submit" className={button}>
+                    Save members
+                  </button>
+                  <button
+                    formAction={deleteGroup}
+                    className="rounded-md border border-edge px-3 py-1.5 text-sm font-medium text-critical hover:bg-page"
+                  >
+                    Delete group
+                  </button>
+                </div>
+              </div>
+              <SiteCheckboxes sites={sites} checked={new Set(group.siteIds)} />
+            </form>
+          </Card>
+        ))}
+        <Card className="p-4">
+          <form action={createGroup}>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <input
+                name="name"
+                required
+                placeholder="New group name… e.g. Locksmiths"
+                className="w-64 rounded-md border border-edge bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-1 focus:ring-series-1"
+                aria-label="Group name"
+              />
+              <button type="submit" className={button}>
+                Create group
+              </button>
+            </div>
+            <SiteCheckboxes sites={sites} />
+          </form>
+        </Card>
+      </div>
+    </div>
+  );
+}
 
 export default async function SitesPage({
   searchParams,
@@ -13,13 +170,17 @@ export default async function SitesPage({
   const params = await searchParams;
 
   // Real Search Console data takes over as soon as a property is tracked.
-  let realSites = await getRealSites();
+  const allRealSites = await getRealSites();
+  let realSites = allRealSites;
   const scopeRaw = typeof params.scope === "string" ? params.scope : "";
-  if (scopeRaw.startsWith("site:")) {
-    realSites = realSites.filter((s) => s.id === scopeRaw.slice(5));
+  const scopedIds = await getRealScopeSiteIds(scopeRaw || undefined);
+  if (scopedIds) {
+    const idSet = new Set(scopedIds);
+    realSites = realSites.filter((s) => idSet.has(s.id));
   }
   const rangeDays = Math.min(Number(params.range ?? 28) || 28, 180);
-  if (realSites.length > 0) {
+  if (allRealSites.length > 0) {
+    const groups = await getRealGroups();
     const rows = await Promise.all(
       realSites.map(async (site) => {
         const series = await getRealDailySeries(site.propertyId, rangeDays * 2);
@@ -65,6 +226,12 @@ export default async function SitesPage({
           title="Sites"
           subtitle={`${rows.length} tracked ${rows.length === 1 ? "property" : "properties"} · real Search Console data · last ${rangeDays} days`}
         />
+        {rows.length === 0 ? (
+          <EmptyState
+            title="No sites in this scope"
+            body="The selected group contains no sites. Add sites to it below, or switch back to all tracked properties."
+          />
+        ) : (
         <Card className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="text-xs uppercase tracking-wide text-muted">
@@ -98,10 +265,12 @@ export default async function SitesPage({
             </tbody>
           </table>
         </Card>
+        )}
         <p className="mt-3 text-xs text-muted">
           Data imports nightly once scheduling lands (Phase 6); use “Resume / update import” on the
           Connections page to refresh manually until then.
         </p>
+        <GroupManager groups={groups} sites={allRealSites} />
       </div>
     );
   }

@@ -2,7 +2,7 @@ import Link from "next/link";
 import { Card, EmptyState, PageHeader } from "@/components/ui";
 import { CoverageMatrixClient } from "@/components/CoverageMatrixClient";
 import { getCoverage, getScopedSiteIds, getServices, getSites } from "@/lib/data";
-import { getRealSites } from "@/lib/data/real";
+import { getRealScopeSiteIds, getRealSites } from "@/lib/data/real";
 import { getServerClient } from "@/lib/supabase/server";
 import {
   buildNetworkMatrix,
@@ -130,12 +130,15 @@ export default async function CoveragePage({
       return <EmptyState title="No organisation" body="Your user is not a member of an organisation yet." />;
     }
 
-    const matrix = await buildNetworkMatrix(supabase!, membership.organisation_id);
-    // Honour the global site selector.
-    if (scopeRaw?.startsWith("site:")) {
-      const siteId = scopeRaw.slice(5);
-      matrix.sites = matrix.sites.filter((s) => s.siteId === siteId);
-    }
+    // Scope the matrix to the selected group/site BEFORE building it, so the
+    // topic universe reflects only that industry's queries.
+    const scopedIds = await getRealScopeSiteIds(scopeRaw);
+    const matrix = await buildNetworkMatrix(
+      supabase!,
+      membership.organisation_id,
+      15,
+      scopedIds ?? undefined,
+    );
 
     return (
       <div>

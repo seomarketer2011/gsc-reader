@@ -37,6 +37,38 @@ export async function getRealSite(siteId: string): Promise<RealSite | null> {
   return (await getRealSites()).find((s) => s.id === siteId) ?? null;
 }
 
+export interface RealGroup {
+  id: string;
+  name: string;
+  siteIds: string[];
+}
+
+/** User-defined site groups (campaigns) — e.g. all locksmith sites. */
+export async function getRealGroups(): Promise<RealGroup[]> {
+  const supabase = await getServerClient();
+  if (!supabase) return [];
+  const { data } = await supabase
+    .from("campaigns")
+    .select("id, name, campaign_sites (site_id)")
+    .order("created_at");
+  return (data ?? []).map((row) => ({
+    id: row.id as string,
+    name: row.name as string,
+    siteIds: ((row.campaign_sites ?? []) as { site_id: string }[]).map((cs) => cs.site_id),
+  }));
+}
+
+/** Site ids for a real-mode scope string ("campaign:x" / "site:y"), or null when unscoped. */
+export async function getRealScopeSiteIds(scopeRaw: string | undefined): Promise<string[] | null> {
+  if (!scopeRaw) return null;
+  if (scopeRaw.startsWith("site:")) return [scopeRaw.slice(5)];
+  if (scopeRaw.startsWith("campaign:")) {
+    const group = (await getRealGroups()).find((g) => g.id === scopeRaw.slice(9));
+    return group ? group.siteIds : [];
+  }
+  return null;
+}
+
 /** Daily totals from the gsc_site_daily view, oldest→newest, gaps filled. */
 export async function getRealDailySeries(propertyId: string, days: number): Promise<DailyPoint[]> {
   const supabase = await getServerClient();

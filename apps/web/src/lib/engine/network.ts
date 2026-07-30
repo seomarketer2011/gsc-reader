@@ -73,17 +73,19 @@ export async function buildNetworkMatrix(
   service: SupabaseClient,
   orgId: string,
   topicLimit = 15,
+  siteIds?: string[],
 ): Promise<NetworkMatrix> {
   const { data: props } = await service
     .from("gsc_properties")
     .select("id, property_uri, sites (id, domain)")
     .eq("organisation_id", orgId);
+  const keep = siteIds ? new Set(siteIds) : null;
   const sites: NetworkSite[] = (props ?? [])
     .map((p) => {
       const site = (Array.isArray(p.sites) ? p.sites[0] : p.sites) as { id: string; domain: string } | null;
       return site ? { siteId: site.id, propertyId: p.id as string, domain: site.domain } : null;
     })
-    .filter((s): s is NetworkSite => s !== null);
+    .filter((s): s is NetworkSite => s !== null && (!keep || keep.has(s.siteId)));
 
   const extraLocations = locationsFromDomains(sites.map((s) => s.domain));
   const perSite = new Map<string, Map<string, QueryClusterAgg>>();
@@ -122,13 +124,19 @@ export async function buildNetworkMatrix(
  * Network rollout detector: a topic strong on ≥1 site and absent/weak on
  * another site that shows RELATED demand (same head term in its own queries).
  * Writes one org-level opportunity per qualifying topic (site_id null).
+ *
+ * `group` restricts the pooled analysis to one user-defined site group
+ * (e.g. all locksmith sites) so unrelated industries never mix; the caller
+ * is then responsible for clearing previous network opportunities once.
  */
 export async function detectNetworkOpportunities(
   service: SupabaseClient,
   org: { id: string },
+  group?: { name: string; siteIds: string[]; keepExisting?: boolean },
 ): Promise<number> {
-  const matrix = await buildNetworkMatrix(service, org.id, 40);
+  const matrix = await buildNetworkMatrix(service, org.id, 40, group?.siteIds);
   if (matrix.sites.length < 2) return 0;
+  const groupLabel = group?.name ?? "network";
 
   const headTerm = (key: string) => key.replace(" [location]", "").split(" ")[0];
   const found: Array<{
@@ -170,13 +178,16 @@ export async function detectNetworkOpportunities(
     }
   }
 
-  // Replace previous org-level network opportunities.
-  await service
-    .from("opportunities")
-    .delete()
-    .eq("organisation_id", org.id)
-    .is("site_id", null)
-    .eq("status", "open");
+  // Replace previous org-level network opportunities (unless the caller
+  // already cleared them, e.g. when running once per group).
+  if (!group?.keepExisting) {
+    await service
+      .from("opportunities")
+      .delete()
+      .eq("organisation_id", org.id)
+      .is("site_id", null)
+      .eq("status", "open");
+  }
   if (found.length === 0) return 0;
 
   const top = found.slice(0, 15);
@@ -192,7 +203,7 @@ export async function detectNetworkOpportunities(
           organisation_id: org.id,
           type: "missing_dedicated_page",
           status: "open",
-          title: `Roll out “${f.topic.name}” across the network`,
+          title: `Roll out “${f.topic.name}” across the ${groupLabel}`,
           site_id: null,
           score: Math.min(90, 30 + f.totalImpressions / 20 + (create + improve) * 8),
           network_impressions: f.totalImpressions,
@@ -228,4 +239,50 @@ export async function detectNetworkOpportunities(
     );
   }
   return top.length;
+}
+
+/**
+ * Runs the network detector once per user-defined site group (campaign), so
+ * each industry is pooled only with its own kind. Sites in no group form a
+ * final "network" pool of their own; with no groups at all, the whole org is
+ * one pool (the original behaviour).
+ */
+export async function runNetworkAnalysis(service: SupabaseClient, orgId: string): Promise<number> {
+  const { data: groups } = await service
+    .from("campaigns")
+    .select("id, name, campaign_sites (site_id)")
+    .eq("organisation_id", orgId);
+  if (!groups || groups.length === 0) return detectNetworkOpportunities(service, { id: orgId });
+
+  // Clear previous network opportunities once, then accumulate per group.
+  await service
+    .from("opportunities")
+    .delete()
+    .eq("organisation_id", orgId)
+    .is("site_id", null)
+    .eq("status", "open");
+
+  const grouped = new Set<string>();
+  let total = 0;
+  for (const g of groups) {
+    const siteIds = ((g.campaign_sites ?? []) as { site_id: string }[]).map((cs) => cs.site_id);
+    for (const id of siteIds) grouped.add(id);
+    if (siteIds.length < 2) continue; // pooling needs at least two sites
+    total += await detectNetworkOpportunities(service, { id: orgId }, {
+      name: `${g.name as string} group`,
+      siteIds,
+      keepExisting: true,
+    });
+  }
+
+  const { data: allSites } = await service.from("sites").select("id").eq("organisation_id", orgId);
+  const ungrouped = (allSites ?? []).map((s) => s.id as string).filter((id) => !grouped.has(id));
+  if (ungrouped.length >= 2) {
+    total += await detectNetworkOpportunities(service, { id: orgId }, {
+      name: "ungrouped sites",
+      siteIds: ungrouped,
+      keepExisting: true,
+    });
+  }
+  return total;
 }
