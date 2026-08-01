@@ -12,6 +12,7 @@ import {
   RealSite,
 } from "@/lib/data/real";
 import { getServerClient } from "@/lib/supabase/server";
+import { PendingButton } from "@/components/PendingButton";
 import { formatInt, parseScope } from "@/lib/format";
 
 async function callerOrgId() {
@@ -34,19 +35,35 @@ async function createGroup(formData: FormData) {
   const name = String(formData.get("name") ?? "").trim();
   const siteIds = formData.getAll("site").map(String);
   if (!caller || !name) return;
-  const { data: group } = await caller.supabase
+  // Idempotent by name: repeat submissions (double clicks, Enter-key repeats,
+  // pre-hydration replays) update the existing group instead of duplicating it.
+  const { data: existing } = await caller.supabase
     .from("campaigns")
-    .insert({ organisation_id: caller.orgId, name })
     .select("id")
-    .single();
-  if (group && siteIds.length > 0) {
-    await caller.supabase.from("campaign_sites").insert(
-      siteIds.map((siteId) => ({
-        organisation_id: caller.orgId,
-        campaign_id: group.id,
-        site_id: siteId,
-      })),
-    );
+    .eq("organisation_id", caller.orgId)
+    .eq("name", name)
+    .limit(1)
+    .maybeSingle();
+  let groupId = existing?.id as string | undefined;
+  if (!groupId) {
+    const { data: group } = await caller.supabase
+      .from("campaigns")
+      .insert({ organisation_id: caller.orgId, name })
+      .select("id")
+      .single();
+    groupId = group?.id as string | undefined;
+  }
+  if (groupId) {
+    await caller.supabase.from("campaign_sites").delete().eq("campaign_id", groupId);
+    if (siteIds.length > 0) {
+      await caller.supabase.from("campaign_sites").insert(
+        siteIds.map((siteId) => ({
+          organisation_id: caller.orgId,
+          campaign_id: groupId,
+          site_id: siteId,
+        })),
+      );
+    }
   }
   revalidatePath("/", "layout"); // group list feeds the global View selector
 }
@@ -125,15 +142,14 @@ function GroupManager({ groups, sites }: { groups: RealGroup[]; sites: RealSite[
                   </span>
                 </div>
                 <div className="flex gap-2">
-                  <button type="submit" className={button}>
-                    Save members
-                  </button>
-                  <button
+                  <PendingButton className={button}>Save members</PendingButton>
+                  <PendingButton
                     formAction={deleteGroup}
+                    pendingLabel="Working…"
                     className="rounded-md border border-edge px-3 py-1.5 text-sm font-medium text-critical hover:bg-page"
                   >
                     Delete group
-                  </button>
+                  </PendingButton>
                 </div>
               </div>
               <SiteCheckboxes sites={sites} checked={new Set(group.siteIds)} />
@@ -150,9 +166,9 @@ function GroupManager({ groups, sites }: { groups: RealGroup[]; sites: RealSite[
                 className="w-64 rounded-md border border-edge bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-1 focus:ring-series-1"
                 aria-label="Group name"
               />
-              <button type="submit" className={button}>
+              <PendingButton className={button} pendingLabel="Creating…">
                 Create group
-              </button>
+              </PendingButton>
             </div>
             <SiteCheckboxes sites={sites} />
           </form>
