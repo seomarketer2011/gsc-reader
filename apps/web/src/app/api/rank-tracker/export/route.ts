@@ -87,8 +87,17 @@ export async function GET() {
   for (const d of domains) {
     const key = (d.serp_location ?? d.location)?.split(",")[0].trim().toLowerCase();
     if (!key) continue;
+    const town = d.location?.trim();
+    const checkpoint = d.serp_location?.split(",")[0].trim();
     homeKey.set(normaliseDomain(d.domain), key);
-    homeLabel.set(normaliseDomain(d.domain), (d.location ?? d.serp_location ?? "").trim());
+    homeLabel.set(
+      normaliseDomain(d.domain),
+      town
+        ? checkpoint && checkpoint.toLowerCase() !== town.toLowerCase()
+          ? `${town} (${checkpoint})`
+          : town
+        : (checkpoint ?? ""),
+    );
   }
 
   const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];

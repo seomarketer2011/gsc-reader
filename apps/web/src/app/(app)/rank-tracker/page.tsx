@@ -137,22 +137,25 @@ async function generateKeywords(formData: FormData) {
       .range(from, to),
   );
   // Keyword wording comes from the town; the SERP is fetched from the town's
-  // checkpoint (serp_location — e.g. "BR1") when one was imported.
-  const checkpointByTown = new Map<string, string>();
+  // checkpoint (serp_location — e.g. "BR1") when one was imported. Keyed on
+  // town+checkpoint so two places sharing a name (Plaistow BR1 vs Plaistow
+  // E13) each get their own keyword set, checked from their own area.
+  const pairs = new Map<string, { town: string; checkpoint: string }>();
   for (const d of domains) {
     const town = (d.location as string).trim();
     if (!town) continue;
-    if (!checkpointByTown.has(town)) checkpointByTown.set(town, d.serp_location?.trim() || town);
+    const checkpoint = d.serp_location?.trim() || town;
+    pairs.set(`${town.toLowerCase()}|${checkpoint.toLowerCase()}`, { town, checkpoint });
   }
 
   const rows: { organisation_id: string; keyword: string; location_name: string }[] = [];
-  if (checkpointByTown.size === 0) {
+  if (pairs.size === 0) {
     for (const p of patterns) {
       if (p.includes("{location}")) continue; // nothing to fill it with
       rows.push({ organisation_id: c.orgId, keyword: p, location_name: "United Kingdom" });
     }
   } else {
-    for (const [town, checkpoint] of checkpointByTown) {
+    for (const { town, checkpoint } of pairs.values()) {
       const locationName = checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`;
       for (const p of patterns) {
         rows.push({
@@ -284,7 +287,15 @@ export default async function RankTrackerPage({
   for (const w of watchDomains) {
     const d = normaliseDomain(w.domain);
     const homeKey = (w.serp_location ?? w.location)?.split(",")[0].trim().toLowerCase() || null;
-    const homeLabel = w.location?.trim() || w.serp_location?.trim() || null;
+    // "Plaistow (E13)" when the checkpoint differs from the town, so two
+    // same-named places stay tellable apart in overlap chips.
+    const town = w.location?.trim();
+    const checkpoint = w.serp_location?.split(",")[0].trim();
+    const homeLabel = town
+      ? checkpoint && checkpoint.toLowerCase() !== town.toLowerCase()
+        ? `${town} (${checkpoint})`
+        : town
+      : checkpoint || null;
     const existing = watched.get(d);
     if (existing) {
       existing.homeKey = homeKey ?? existing.homeKey;
