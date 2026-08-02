@@ -258,6 +258,7 @@ export default async function RankTrackerPage({
   const params = await searchParams;
   const q = typeof params.q === "string" ? params.q.trim().toLowerCase() : "";
   const view = typeof params.view === "string" ? params.view : "all";
+  const sort = typeof params.sort === "string" ? params.sort : "az";
 
   const c = await caller();
   if (!c) {
@@ -423,14 +424,52 @@ export default async function RankTrackerPage({
     if (view === "failed") return Boolean(s.check?.error);
     return true;
   });
+  // Order: keywords come A–Z from the query; position sorts put #1s first
+  // and push unranked/unchecked rows to the bottom.
+  if (sort === "best") {
+    visible.sort(
+      (a, b) =>
+        (a.ranked[0]?.position ?? 999) - (b.ranked[0]?.position ?? 999) ||
+        a.k.keyword.localeCompare(b.k.keyword),
+    );
+  } else if (sort === "home") {
+    visible.sort(
+      (a, b) =>
+        (a.home?.position ?? 999) - (b.home?.position ?? 999) ||
+        a.k.keyword.localeCompare(b.k.keyword),
+    );
+  } else if (sort === "sites") {
+    visible.sort(
+      (a, b) => b.ranked.length - a.ranked.length || a.k.keyword.localeCompare(b.k.keyword),
+    );
+  }
 
+  const linkParams = (overrides: Record<string, string>) => {
+    const merged: Record<string, string> = {
+      ...(q ? { q } : {}),
+      ...(view !== "all" ? { view } : {}),
+      ...(sort !== "az" ? { sort } : {}),
+      ...overrides,
+    };
+    for (const key of Object.keys(merged)) if (!merged[key]) delete merged[key];
+    const qs = new URLSearchParams(merged).toString();
+    return `/rank-tracker${qs ? `?${qs}` : ""}`;
+  };
   const viewLink = (v: string, label: string, count?: number) => (
     <Link
-      href={`/rank-tracker?${new URLSearchParams({ ...(q ? { q } : {}), ...(v === "all" ? {} : { view: v }) })}`}
+      href={linkParams({ view: v === "all" ? "" : v })}
       className={`rounded-md px-2 py-1 ${view === v ? "bg-page font-medium text-series-1" : "text-ink-2 hover:text-ink"}`}
     >
       {label}
       {count !== undefined && <span className="ml-1 tnum text-muted">{count}</span>}
+    </Link>
+  );
+  const sortLink = (s: string, label: string) => (
+    <Link
+      href={linkParams({ sort: s === "az" ? "" : s })}
+      className={`rounded-md px-2 py-1 ${sort === s ? "bg-page font-medium text-series-1" : "text-ink-2 hover:text-ink"}`}
+    >
+      {label}
     </Link>
   );
 
@@ -518,6 +557,7 @@ export default async function RankTrackerPage({
             <span className="ml-auto flex items-center gap-2">
               <form method="GET" className="flex items-center gap-2">
                 {view !== "all" && <input type="hidden" name="view" value={view} />}
+                {sort !== "az" && <input type="hidden" name="sort" value={sort} />}
                 <input
                   name="q"
                   defaultValue={q}
@@ -528,13 +568,20 @@ export default async function RankTrackerPage({
               </form>
               {q && (
                 <Link
-                  href={`/rank-tracker${view !== "all" ? `?view=${view}` : ""}`}
+                  href={linkParams({ q: "" })}
                   className="whitespace-nowrap rounded-md border border-edge px-2 py-1 text-sm font-medium text-ink-2 hover:text-ink"
                 >
                   Clear “{q.length > 14 ? `${q.slice(0, 14)}…` : q}” ✕
                 </Link>
               )}
             </span>
+          </div>
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
+            <span className="text-muted">Order by</span>
+            {sortLink("az", "A–Z")}
+            {sortLink("best", "Best position")}
+            {sortLink("home", "Home position")}
+            {sortLink("sites", "Sites ranking")}
           </div>
 
           <div className="space-y-3">
