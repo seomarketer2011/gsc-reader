@@ -4,7 +4,7 @@ import { Badge, Card, EmptyState, PageHeader, StatTile } from "@/components/ui";
 import { PendingButton } from "@/components/PendingButton";
 import { RankCheckButton } from "@/components/RankCheckButton";
 import { getServerClient } from "@/lib/supabase/server";
-import { normaliseDomain, TopResult } from "@/lib/engine/serp";
+import { fetchUkTownIndex, normaliseDomain, TopResult } from "@/lib/engine/serp";
 import { SupabaseClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
@@ -59,11 +59,16 @@ async function addDomains(formData: FormData) {
   }
   if (rows.length === 0) return;
   const byDomain = new Map(rows.map((r) => [r.domain, r]));
+  // Validate towns against DataForSEO's UK location list (free call) so bad
+  // town names surface at import time, not as failed paid checks later.
+  const townIndex = await fetchUkTownIndex();
   await c.supabase.from("tracked_domains").upsert(
     [...byDomain.values()].map((r) => ({
       organisation_id: c.orgId,
       domain: r.domain,
       location: r.location,
+      location_valid:
+        townIndex && r.location ? townIndex.has(r.location.trim().toLowerCase()) : null,
     })),
     { onConflict: "organisation_id,domain" },
   );
@@ -215,10 +220,10 @@ export default async function RankTrackerPage({
         .order("keyword")
         .range(from, to),
     ),
-    fetchAllRows<{ id: string; domain: string; location: string | null }>((from, to) =>
+    fetchAllRows<{ id: string; domain: string; location: string | null; location_valid: boolean | null }>((from, to) =>
       c.supabase
         .from("tracked_domains")
-        .select("id, domain, location")
+        .select("id, domain, location, location_valid")
         .eq("organisation_id", c.orgId)
         .order("domain")
         .range(from, to),
@@ -255,6 +260,7 @@ export default async function RankTrackerPage({
       )
     : [];
   const latestCheck = new Map<string, { date: string; error: string | null; top: TopResult[] }>();
+  const prevCheckDate = new Map<string, string>(); // keyword -> the check before the latest
   for (const row of checks) {
     if (!latestCheck.has(row.keyword_id)) {
       latestCheck.set(row.keyword_id, {
@@ -262,9 +268,13 @@ export default async function RankTrackerPage({
         error: row.error,
         top: row.top_results ?? [],
       });
+    } else if (!prevCheckDate.has(row.keyword_id) && !row.error) {
+      prevCheckDate.set(row.keyword_id, row.check_date);
     }
   }
-  const latestDates = [...new Set([...latestCheck.values()].map((v) => v.date))];
+  const latestDates = [
+    ...new Set([...[...latestCheck.values()].map((v) => v.date), ...prevCheckDate.values()]),
+  ];
   const rankings = latestDates.length
     ? await fetchAllRows<{ keyword_id: string; domain: string; position: number; url: string | null; check_date: string }>(
         (from, to) =>
@@ -278,7 +288,12 @@ export default async function RankTrackerPage({
       )
     : [];
   const rankingsByKeyword = new Map<string, { domain: string; position: number; url: string }[]>();
+  const prevPosition = new Map<string, number>(); // "keywordId|domain" -> previous position
   for (const r of rankings) {
+    if (r.check_date === prevCheckDate.get(r.keyword_id)) {
+      prevPosition.set(`${r.keyword_id}|${r.domain}`, r.position);
+      continue;
+    }
     if (r.check_date !== latestCheck.get(r.keyword_id)?.date) continue;
     const list = rankingsByKeyword.get(r.keyword_id) ?? [];
     list.push({ domain: r.domain, position: r.position, url: r.url ?? "" });
@@ -334,9 +349,19 @@ export default async function RankTrackerPage({
     <div>
       <PageHeader
         title="Rank tracker"
-        subtitle={`Organic Google positions — one SERP check per keyword covers all ${watchedTotal} watched domains at once.`}
+        subtitle={`Organic Google positions — one SERP check per keyword covers all ${watchedTotal} watched domains at once. Refreshes automatically overnight (02:00–06:00 UTC).`}
       >
-        <RankCheckButton keywordCount={keywords.length} />
+        <span className="inline-flex items-center gap-2">
+          {keywords.length > 0 && (
+            <a
+              href="/api/rank-tracker/export"
+              className="rounded-md border border-edge px-3 py-1.5 text-sm font-medium text-ink hover:bg-page"
+            >
+              Export CSV
+            </a>
+          )}
+          <RankCheckButton keywordCount={keywords.length} />
+        </span>
       </PageHeader>
 
       {keywords.length > 0 && (
@@ -436,6 +461,20 @@ export default async function RankTrackerPage({
                           }`}
                         >
                           <Badge tone={positionTone(r.position)}>#{r.position}</Badge>
+                          {(() => {
+                            const prev = prevPosition.get(`${k.id}|${r.domain}`);
+                            if (prev !== undefined && prev !== r.position) {
+                              return prev > r.position ? (
+                                <span className="tnum font-medium text-delta-good">▲{prev - r.position}</span>
+                              ) : (
+                                <span className="tnum font-medium text-critical">▼{r.position - prev}</span>
+                              );
+                            }
+                            if (prev === undefined && prevCheckDate.has(k.id)) {
+                              return <span className="font-medium text-series-1">new</span>;
+                            }
+                            return null;
+                          })()}
                           <span className="text-ink-2">{r.domain}</span>
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
                           {!isHome(r.domain) && watched.get(r.domain)?.homeTown && (
@@ -522,8 +561,19 @@ export default async function RankTrackerPage({
             <p className="text-xs text-muted">
               Copy both columns straight from your spreadsheet — tabs or commas both work.
               Re-importing a domain updates its town. Protocols, www and paths are stripped.
+              Towns are validated against DataForSEO&rsquo;s location list as you import.
             </p>
           </form>
+          {watchDomains.some((w) => w.location_valid === false) && (
+            <p className="mt-2 text-xs text-critical">
+              {watchDomains.filter((w) => w.location_valid === false).length} imported{" "}
+              {watchDomains.filter((w) => w.location_valid === false).length === 1
+                ? "town isn't a"
+                : "towns aren't"}{" "}
+              recognised DataForSEO location (marked ⚠ below) — re-import those rows with the
+              nearest larger town, e.g. Bickley → Bromley, before generating keywords.
+            </p>
+          )}
           {watchDomains.length > 0 && (
             <details className="mt-3 text-xs text-ink-2">
               <summary className="cursor-pointer select-none text-muted hover:text-ink">
@@ -534,7 +584,12 @@ export default async function RankTrackerPage({
                   <form key={w.id} action={deleteDomain} className="flex items-center justify-between gap-2">
                     <span className="truncate">
                       {w.domain}
-                      {w.location && <span className="text-muted"> · {w.location}</span>}
+                      {w.location && (
+                        <span className={w.location_valid === false ? "text-critical" : "text-muted"}>
+                          {" "}· {w.location}
+                          {w.location_valid === false && " ⚠"}
+                        </span>
+                      )}
                     </span>
                     <input type="hidden" name="id" value={w.id} />
                     <PendingButton pendingLabel="…" className="text-muted hover:text-critical">
