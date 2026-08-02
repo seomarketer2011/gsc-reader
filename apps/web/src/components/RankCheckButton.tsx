@@ -3,8 +3,9 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-// Drives the chunked rank check: keeps calling /api/rank-tracker/run until
-// every keyword has today's SERP, then refreshes the dashboard.
+// Drives the queue-based rank check: the first call posts every unchecked
+// keyword to DataForSEO's task queue, then the loop collects results as they
+// finish. Closing the tab is safe — the server cron keeps collecting.
 export function RankCheckButton({ keywordCount }: { keywordCount: number }) {
   const router = useRouter();
   const [state, setState] = useState<"idle" | "running" | "done" | "error">("idle");
@@ -13,26 +14,29 @@ export function RankCheckButton({ keywordCount }: { keywordCount: number }) {
 
   async function run() {
     setState("running");
-    setMessage("Starting…");
+    setMessage("Queuing keywords…");
     cancelled.current = false;
     try {
-      for (let i = 0; i < 600; i++) {
+      for (let i = 0; i < 400; i++) {
         if (cancelled.current) return;
         const res = await fetch("/api/rank-tracker/run", { method: "POST" });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-        setMessage(
-          `${data.checked} of ${data.total} keywords checked…` +
-            (data.errors?.length ? ` (${data.errors[0]})` : ""),
-        );
         if (data.done) {
           setState("done");
           setMessage(`All ${data.total} keywords checked.`);
           router.refresh();
           return;
         }
+        setMessage(
+          `${data.checked} of ${data.total} collected · ${data.processing} processing…`,
+        );
+        // Results arrive over a few minutes — poll gently, not in a tight loop.
+        await new Promise((r) => setTimeout(r, 5000));
       }
-      throw new Error("Run is taking unusually long — press the button to continue.");
+      throw new Error(
+        "Still processing — safe to close this tab; results keep collecting automatically.",
+      );
     } catch (e) {
       setState("error");
       setMessage(e instanceof Error ? e.message : "Check failed");

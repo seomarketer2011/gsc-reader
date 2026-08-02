@@ -6,8 +6,9 @@
   "main": "worker-entry.mjs",
   "triggers": {
     // 03:30 UTC: nightly GSC top-up + re-analysis.
-    // Every 5 min 02:00-05:55 UTC: rank-tracker refresh, one batch per tick.
-    "crons": ["30 3 * * *", "*/5 2-5 * * *"]
+    // Every 5 min, all day: rank-tracker queue tick — collects finished
+    // DataForSEO tasks any time; posts the daily sweep 02:00-05:59 UTC only.
+    "crons": ["30 3 * * *", "*/5 * * * *"]
   },
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],

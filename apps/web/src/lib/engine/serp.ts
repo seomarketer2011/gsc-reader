@@ -120,32 +120,30 @@ async function fetchSerp(keyword: string, locationName: string): Promise<SerpIte
   throw lastTransient ?? new Error("SERP fetch failed");
 }
 
-/**
- * Checks one keyword's SERP and stores the day's results: a serp_checks row
- * (top-10 context, or the error) plus one serp_rankings row per watched
- * domain found in the organic top 100 (best position wins if a domain
- * appears more than once).
- */
-export async function checkKeyword(
+async function recordCheckError(
   service: SupabaseClient,
   orgId: string,
-  keyword: TrackedKeyword,
-  watched: WatchedDomain[],
-): Promise<{ ranked: number; error: string | null }> {
-  let items: SerpItem[];
-  try {
-    items = await fetchSerp(keyword.keyword, keyword.location_name);
-  } catch (e) {
-    const error = e instanceof Error ? e.message.slice(0, 300) : "SERP fetch failed";
-    await service
-      .from("serp_checks")
-      .upsert(
-        { organisation_id: orgId, keyword_id: keyword.id, error, top_results: [] },
-        { onConflict: "keyword_id,check_date" },
-      );
-    return { ranked: 0, error };
-  }
+  keywordId: string,
+  error: string,
+): Promise<void> {
+  await service
+    .from("serp_checks")
+    .upsert(
+      { organisation_id: orgId, keyword_id: keywordId, error: error.slice(0, 300), top_results: [] },
+      { onConflict: "keyword_id,check_date" },
+    );
+}
 
+/** Stores one keyword's SERP: a serp_checks row (top-10 context) plus one
+ * serp_rankings row per watched domain in the organic top 100 (best position
+ * wins if a domain appears more than once). */
+async function storeSerpResult(
+  service: SupabaseClient,
+  orgId: string,
+  keywordId: string,
+  items: SerpItem[],
+  watched: WatchedDomain[],
+): Promise<number> {
   const organic = items.filter((i) => i.type === "organic" && i.domain);
   const topResults: TopResult[] = organic.slice(0, 10).map((i) => ({
     position: i.rank_group,
@@ -169,20 +167,20 @@ export async function checkKeyword(
   await service
     .from("serp_checks")
     .upsert(
-      { organisation_id: orgId, keyword_id: keyword.id, error: null, top_results: topResults },
+      { organisation_id: orgId, keyword_id: keywordId, error: null, top_results: topResults },
       { onConflict: "keyword_id,check_date" },
     );
   // Replace today's rankings for this keyword so re-runs stay consistent.
   await service
     .from("serp_rankings")
     .delete()
-    .eq("keyword_id", keyword.id)
+    .eq("keyword_id", keywordId)
     .eq("check_date", new Date().toISOString().slice(0, 10));
   if (best.size > 0) {
     await service.from("serp_rankings").insert(
       [...best.entries()].map(([domain, r]) => ({
         organisation_id: orgId,
-        keyword_id: keyword.id,
+        keyword_id: keywordId,
         domain,
         site_id: r.siteId,
         position: r.position,
@@ -190,7 +188,173 @@ export async function checkKeyword(
       })),
     );
   }
-  return { ranked: best.size, error: null };
+  return best.size;
+}
+
+/** Live-mode check (premium endpoint). Kept as a fallback; the button and
+ * cron use the ~3x cheaper task queue below. */
+export async function checkKeyword(
+  service: SupabaseClient,
+  orgId: string,
+  keyword: TrackedKeyword,
+  watched: WatchedDomain[],
+): Promise<{ ranked: number; error: string | null }> {
+  let items: SerpItem[];
+  try {
+    items = await fetchSerp(keyword.keyword, keyword.location_name);
+  } catch (e) {
+    const error = e instanceof Error ? e.message.slice(0, 300) : "SERP fetch failed";
+    await recordCheckError(service, orgId, keyword.id, error);
+    return { ranked: 0, error };
+  }
+  const ranked = await storeSerpResult(service, orgId, keyword.id, items, watched);
+  return { ranked, error: null };
+}
+
+// ── Standard task queue (post now, collect minutes later — ~3x cheaper) ───
+
+const TASK_POST_BATCH = 100; // endpoint max per request
+const QUEUE_PAGE = 1000;
+
+function dfsAuth(): string {
+  return Buffer.from(
+    `${process.env.DATAFORSEO_LOGIN}:${process.env.DATAFORSEO_PASSWORD}`,
+  ).toString("base64");
+}
+
+/** Posts SERP tasks for the given keywords and records them in
+ * serp_task_queue. Returns how many were accepted. */
+export async function postSerpTasks(
+  service: SupabaseClient,
+  orgId: string,
+  keywords: TrackedKeyword[],
+): Promise<number> {
+  let posted = 0;
+  for (let i = 0; i < keywords.length; i += TASK_POST_BATCH) {
+    const batch = keywords.slice(i, i + TASK_POST_BATCH);
+    const res = await fetch("https://api.dataforseo.com/v3/serp/google/organic/task_post", {
+      method: "POST",
+      headers: { Authorization: `Basic ${dfsAuth()}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        batch.map((k) => ({
+          keyword: k.keyword,
+          location_name: k.location_name,
+          language_name: "English",
+          depth: 100,
+          priority: 1,
+          tag: k.id,
+        })),
+      ),
+    });
+    if (!res.ok) throw new Error(`DataForSEO task_post HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    const rows: { organisation_id: string; keyword_id: string; task_id: string }[] = [];
+    for (const t of data.tasks ?? []) {
+      const keywordId = t.data?.tag as string | undefined;
+      if (!keywordId) continue;
+      if (t.status_code === 20100 && t.id) {
+        rows.push({ organisation_id: orgId, keyword_id: keywordId, task_id: t.id as string });
+      } else {
+        await recordCheckError(service, orgId, keywordId, `task_post ${t.status_code}: ${t.status_message}`);
+      }
+    }
+    if (rows.length > 0) {
+      await service.from("serp_task_queue").upsert(rows, { onConflict: "keyword_id,check_date" });
+      posted += rows.length;
+    }
+  }
+  return posted;
+}
+
+interface QueueRow {
+  id: string;
+  keyword_id: string;
+  task_id: string;
+  posted_at: string;
+}
+
+/**
+ * Collects finished tasks for one organisation: asks DataForSEO which tasks
+ * are ready, fetches those results, stores them, and clears the queue rows.
+ * Rows older than 20 minutes are polled directly (covers tasks whose "ready"
+ * notification was consumed by an earlier crashed run); rows older than 24h
+ * are expired. Returns progress counts.
+ */
+export async function collectSerpResults(
+  service: SupabaseClient,
+  orgId: string,
+  watched: WatchedDomain[],
+  maxTasks = 40,
+): Promise<{ collected: number; failed: number; remaining: number }> {
+  const queue: QueueRow[] = [];
+  for (let from = 0; ; from += QUEUE_PAGE) {
+    const { data } = await service
+      .from("serp_task_queue")
+      .select("id, keyword_id, task_id, posted_at")
+      .eq("organisation_id", orgId)
+      .order("posted_at")
+      .range(from, from + QUEUE_PAGE - 1);
+    queue.push(...((data ?? []) as QueueRow[]));
+    if (!data || data.length < QUEUE_PAGE) break;
+  }
+  if (queue.length === 0) return { collected: 0, failed: 0, remaining: 0 };
+  const byTaskId = new Map(queue.map((q) => [q.task_id, q]));
+
+  // Which of our tasks are ready?
+  const readyRes = await fetch("https://api.dataforseo.com/v3/serp/google/organic/tasks_ready", {
+    headers: { Authorization: `Basic ${dfsAuth()}` },
+  });
+  const readyIds: string[] = [];
+  if (readyRes.ok) {
+    const readyData = await readyRes.json();
+    for (const r of readyData.tasks?.[0]?.result ?? []) {
+      if (r.id && byTaskId.has(r.id as string)) readyIds.push(r.id as string);
+    }
+  }
+  // Stale rows: poll directly in case their "ready" entry was already consumed.
+  const now = Date.now();
+  const readySet = new Set(readyIds);
+  const stale = queue.filter(
+    (q) => !readySet.has(q.task_id) && now - new Date(q.posted_at).getTime() > 20 * 60000,
+  );
+  const toFetch = [...readyIds, ...stale.map((s) => s.task_id)].slice(0, maxTasks);
+
+  let collected = 0;
+  let failed = 0;
+  const PARALLEL = 5;
+  for (let i = 0; i < toFetch.length; i += PARALLEL) {
+    await Promise.all(
+      toFetch.slice(i, i + PARALLEL).map(async (taskId) => {
+        const row = byTaskId.get(taskId)!;
+        const res = await fetch(
+          `https://api.dataforseo.com/v3/serp/google/organic/task_get/regular/${taskId}`,
+          { headers: { Authorization: `Basic ${dfsAuth()}` } },
+        );
+        if (!res.ok) return; // transient — try again next collect
+        const data = await res.json();
+        const task = data.tasks?.[0];
+        const code = Number(task?.status_code ?? 0);
+        if (code === 20000) {
+          const items = (task.result?.[0]?.items ?? []) as SerpItem[];
+          await storeSerpResult(service, orgId, row.keyword_id, items, watched);
+          await service.from("serp_task_queue").delete().eq("id", row.id);
+          collected++;
+        } else if (code === 20100 || code === 40601 || code === 40602 || code === 40603) {
+          // Still queued/processing (or briefly unfindable) — expire after 24h.
+          if (now - new Date(row.posted_at).getTime() > 24 * 3600000) {
+            await recordCheckError(service, orgId, row.keyword_id, `task expired (${code}: ${task?.status_message})`);
+            await service.from("serp_task_queue").delete().eq("id", row.id);
+            failed++;
+          }
+        } else {
+          await recordCheckError(service, orgId, row.keyword_id, `DataForSEO task ${code}: ${task?.status_message}`);
+          await service.from("serp_task_queue").delete().eq("id", row.id);
+          failed++;
+        }
+      }),
+    );
+  }
+  return { collected, failed, remaining: queue.length - collected - failed };
 }
 
 /** Union of GSC-connected sites and the plain watch-list, deduped by domain. */
