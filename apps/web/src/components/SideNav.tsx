@@ -10,6 +10,7 @@ const ITEMS = [
   { href: "/clusters", label: "Query clusters", icon: "≣" },
   { href: "/rollouts", label: "Rollouts", icon: "⇶" },
   { href: "/keywords", label: "Keyword research", icon: "⌕" },
+  { href: "/rank-tracker", label: "Rank tracker", icon: "⌖" },
   { href: "/connections", label: "Google connections", icon: "⚲" },
 ];
 
