@@ -16,7 +16,7 @@ export function RankCheckButton({ keywordCount }: { keywordCount: number }) {
     setMessage("Starting…");
     cancelled.current = false;
     try {
-      for (let i = 0; i < 200; i++) {
+      for (let i = 0; i < 600; i++) {
         if (cancelled.current) return;
         const res = await fetch("/api/rank-tracker/run", { method: "POST" });
         const data = await res.json();
