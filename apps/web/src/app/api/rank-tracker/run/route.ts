@@ -86,7 +86,7 @@ export async function POST() {
   const posted = toPost.length > 0 ? await postSerpTasks(service, orgId, toPost) : 0;
 
   const watched = await getWatchedDomains(service, orgId);
-  const { remaining } = await collectSerpResults(service, orgId, watched, 60);
+  const { remaining } = await collectSerpResults(service, orgId, watched, 150);
 
   const { count: checkedCount } = await service
     .from("serp_checks")

@@ -319,9 +319,12 @@ export async function collectSerpResults(
   );
   const toFetch = [...readyIds, ...stale.map((s) => s.task_id)].slice(0, maxTasks);
 
-  let collected = 0;
-  let failed = 0;
-  const PARALLEL = 5;
+  // Fetch results in parallel, then write everything in a handful of BATCHED
+  // database calls — this is what lets one pass swallow hundreds of results
+  // without hitting Worker subrequest limits.
+  const successes: { row: QueueRow; items: SerpItem[] }[] = [];
+  const failures: { row: QueueRow; message: string }[] = [];
+  const PARALLEL = 10;
   for (let i = 0; i < toFetch.length; i += PARALLEL) {
     await Promise.all(
       toFetch.slice(i, i + PARALLEL).map(async (taskId) => {
@@ -335,26 +338,93 @@ export async function collectSerpResults(
         const task = data.tasks?.[0];
         const code = Number(task?.status_code ?? 0);
         if (code === 20000) {
-          const items = (task.result?.[0]?.items ?? []) as SerpItem[];
-          await storeSerpResult(service, orgId, row.keyword_id, items, watched);
-          await service.from("serp_task_queue").delete().eq("id", row.id);
-          collected++;
+          successes.push({ row, items: (task.result?.[0]?.items ?? []) as SerpItem[] });
         } else if (code === 20100 || code === 40601 || code === 40602 || code === 40603) {
           // Still queued/processing (or briefly unfindable) — expire after 24h.
           if (now - new Date(row.posted_at).getTime() > 24 * 3600000) {
-            await recordCheckError(service, orgId, row.keyword_id, `task expired (${code}: ${task?.status_message})`);
-            await service.from("serp_task_queue").delete().eq("id", row.id);
-            failed++;
+            failures.push({ row, message: `task expired (${code}: ${task?.status_message})` });
           }
         } else {
-          await recordCheckError(service, orgId, row.keyword_id, `DataForSEO task ${code}: ${task?.status_message}`);
-          await service.from("serp_task_queue").delete().eq("id", row.id);
-          failed++;
+          failures.push({ row, message: `DataForSEO task ${code}: ${task?.status_message}` });
         }
       }),
     );
   }
-  return { collected, failed, remaining: queue.length - collected - failed };
+
+  const byDomain = new Map(watched.map((w) => [w.domain, w]));
+  const today = new Date().toISOString().slice(0, 10);
+  const checkRows: Record<string, unknown>[] = [];
+  const rankingRows: Record<string, unknown>[] = [];
+  for (const { row, items } of successes) {
+    const organic = items.filter((i) => i.type === "organic" && i.domain);
+    checkRows.push({
+      organisation_id: orgId,
+      keyword_id: row.keyword_id,
+      error: null,
+      top_results: organic.slice(0, 10).map((i) => ({
+        position: i.rank_group,
+        domain: normaliseDomain(i.domain!),
+        url: i.url ?? "",
+        title: i.title ?? "",
+      })),
+    });
+    const best = new Map<string, { position: number; url: string; siteId: string | null }>();
+    for (const item of organic) {
+      const domain = normaliseDomain(item.domain!);
+      const watch = byDomain.get(domain);
+      if (!watch) continue;
+      const existing = best.get(domain);
+      if (!existing || item.rank_group < existing.position) {
+        best.set(domain, { position: item.rank_group, url: item.url ?? "", siteId: watch.siteId });
+      }
+    }
+    for (const [domain, r] of best) {
+      rankingRows.push({
+        organisation_id: orgId,
+        keyword_id: row.keyword_id,
+        domain,
+        site_id: r.siteId,
+        position: r.position,
+        url: r.url,
+      });
+    }
+  }
+  for (const { row, message } of failures) {
+    checkRows.push({
+      organisation_id: orgId,
+      keyword_id: row.keyword_id,
+      error: message.slice(0, 300),
+      top_results: [],
+    });
+  }
+
+  const CHUNK = 100; // keep .in() URLs and payloads comfortable
+  for (let i = 0; i < checkRows.length; i += CHUNK) {
+    await service
+      .from("serp_checks")
+      .upsert(checkRows.slice(i, i + CHUNK), { onConflict: "keyword_id,check_date" });
+  }
+  const successIds = successes.map((s) => s.row.keyword_id);
+  for (let i = 0; i < successIds.length; i += CHUNK) {
+    await service
+      .from("serp_rankings")
+      .delete()
+      .in("keyword_id", successIds.slice(i, i + CHUNK))
+      .eq("check_date", today);
+  }
+  for (let i = 0; i < rankingRows.length; i += CHUNK) {
+    await service.from("serp_rankings").insert(rankingRows.slice(i, i + CHUNK));
+  }
+  const doneRowIds = [...successes, ...failures].map((s) => s.row.id);
+  for (let i = 0; i < doneRowIds.length; i += CHUNK) {
+    await service.from("serp_task_queue").delete().in("id", doneRowIds.slice(i, i + CHUNK));
+  }
+
+  return {
+    collected: successes.length,
+    failed: failures.length,
+    remaining: queue.length - successes.length - failures.length,
+  };
 }
 
 /** Union of GSC-connected sites and the plain watch-list, deduped by domain. */

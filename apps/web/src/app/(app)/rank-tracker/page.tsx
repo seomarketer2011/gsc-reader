@@ -515,16 +515,26 @@ export default async function RankTrackerPage({
                 </form>
               ) : null;
             })()}
-            <form className="ml-auto" method="GET">
-              {view !== "all" && <input type="hidden" name="view" value={view} />}
-              <input
-                name="q"
-                defaultValue={q}
-                placeholder="Filter by keyword or town…"
-                className={`${input} w-64`}
-                aria-label="Filter keywords"
-              />
-            </form>
+            <span className="ml-auto flex items-center gap-2">
+              <form method="GET" className="flex items-center gap-2">
+                {view !== "all" && <input type="hidden" name="view" value={view} />}
+                <input
+                  name="q"
+                  defaultValue={q}
+                  placeholder="Filter by keyword or town… (Enter to apply)"
+                  className={`${input} w-64`}
+                  aria-label="Filter keywords"
+                />
+              </form>
+              {q && (
+                <Link
+                  href={`/rank-tracker${view !== "all" ? `?view=${view}` : ""}`}
+                  className="whitespace-nowrap rounded-md border border-edge px-2 py-1 text-sm font-medium text-ink-2 hover:text-ink"
+                >
+                  Clear “{q.length > 14 ? `${q.slice(0, 14)}…` : q}” ✕
+                </Link>
+              )}
+            </span>
           </div>
 
           <div className="space-y-3">
