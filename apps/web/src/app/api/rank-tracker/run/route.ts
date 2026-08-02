@@ -1,13 +1,20 @@
 import { NextResponse } from "next/server";
-import { checkKeyword, dataForSeoConfigured, getWatchedDomains } from "@/lib/engine/serp";
+import {
+  collectSerpResults,
+  dataForSeoConfigured,
+  getWatchedDomains,
+  postSerpTasks,
+} from "@/lib/engine/serp";
 import { getServerClient, getServiceClient } from "@/lib/supabase/server";
-import { SupabaseClient } from "@supabase/supabase-js";
 
-// Checks the next few unchecked keywords for today, in parallel. The client
-// loops until done — same chunked pattern as the GSC import — so any number
-// of keywords fits within Worker limits. Each keyword costs one paid SERP.
-const CHUNK = 5;
-const PAGE = 1000; // Supabase caps a single select at 1000 rows
+export const maxDuration = 300;
+
+// Queue-based run: the first call posts every unchecked keyword to
+// DataForSEO's task queue (seconds, ~3x cheaper than live mode); subsequent
+// calls collect finished results until the queue drains. The client loops
+// with a short delay — and even if the tab closes, the */5 cron collects
+// whatever is still in flight.
+const PAGE = 1000;
 
 async function fetchAllRows<T>(
   build: (from: number, to: number) => PromiseLike<{ data: T[] | null }>,
@@ -34,14 +41,14 @@ export async function POST() {
   if (!membership) return NextResponse.json({ error: "no organisation" }, { status: 403 });
   const orgId = membership.organisation_id as string;
 
-  const service: SupabaseClient | null = getServiceClient();
+  const service = getServiceClient();
   if (!service) return NextResponse.json({ error: "service key missing" }, { status: 500 });
   if (!dataForSeoConfigured()) {
     return NextResponse.json({ error: "DataForSEO credentials are not configured" }, { status: 500 });
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const [keywords, checkedToday] = await Promise.all([
+  const [keywords, checkedToday, queuedToday] = await Promise.all([
     fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
       service
         .from("tracked_keywords")
@@ -59,31 +66,39 @@ export async function POST() {
         .order("keyword_id")
         .range(from, to),
     ),
+    fetchAllRows<{ keyword_id: string }>((from, to) =>
+      service
+        .from("serp_task_queue")
+        .select("keyword_id")
+        .eq("organisation_id", orgId)
+        .order("keyword_id")
+        .range(from, to),
+    ),
   ]);
   const total = keywords.length;
-  if (total === 0) return NextResponse.json({ done: true, checked: 0, total: 0 });
+  if (total === 0) return NextResponse.json({ done: true, checked: 0, total: 0, processing: 0 });
 
-  const doneIds = new Set(checkedToday.map((c) => c.keyword_id));
-  const pending = keywords.filter((k) => !doneIds.has(k.id));
-  if (pending.length === 0) {
-    return NextResponse.json({ done: true, checked: total, total });
-  }
+  const excluded = new Set([
+    ...checkedToday.map((c) => c.keyword_id),
+    ...queuedToday.map((q) => q.keyword_id),
+  ]);
+  const toPost = keywords.filter((k) => !excluded.has(k.id));
+  const posted = toPost.length > 0 ? await postSerpTasks(service, orgId, toPost) : 0;
 
   const watched = await getWatchedDomains(service, orgId);
-  const results = await Promise.all(
-    pending.slice(0, CHUNK).map((k) =>
-      checkKeyword(service, orgId, k, watched).then((r) =>
-        r.error ? `${k.keyword}: ${r.error}` : null,
-      ),
-    ),
-  );
-  const errors = results.filter((e): e is string => e !== null);
+  const { remaining } = await collectSerpResults(service, orgId, watched, 60);
 
-  const checked = total - Math.max(0, pending.length - CHUNK);
+  const { count: checkedCount } = await service
+    .from("serp_checks")
+    .select("id", { count: "exact", head: true })
+    .eq("organisation_id", orgId)
+    .eq("check_date", today);
+
   return NextResponse.json({
-    done: pending.length <= CHUNK,
-    checked,
+    done: remaining === 0 && toPost.length - posted === 0 && (checkedCount ?? 0) >= total,
+    checked: checkedCount ?? 0,
     total,
-    errors: errors.slice(0, 3),
+    posted,
+    processing: remaining,
   });
 }
