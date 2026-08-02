@@ -310,9 +310,17 @@ export default async function RankTrackerPage({
   // Watched universe: GSC-connected sites + watch-list, deduped by domain.
   // homeKey matches a domain to the keywords checked from its checkpoint
   // (serp_location when set, town otherwise); homeLabel is the display name.
-  const watched = new Map<string, { gsc: boolean; homeKey: string | null; homeLabel: string | null }>();
+  const watched = new Map<
+    string,
+    { gsc: boolean; homeKey: string | null; homeLabel: string | null; homeTownLower: string | null }
+  >();
   for (const s of sites ?? []) {
-    watched.set(normaliseDomain(s.domain as string), { gsc: true, homeKey: null, homeLabel: null });
+    watched.set(normaliseDomain(s.domain as string), {
+      gsc: true,
+      homeKey: null,
+      homeLabel: null,
+      homeTownLower: null,
+    });
   }
   for (const w of watchDomains) {
     const d = normaliseDomain(w.domain);
@@ -330,7 +338,8 @@ export default async function RankTrackerPage({
     if (existing) {
       existing.homeKey = homeKey ?? existing.homeKey;
       existing.homeLabel = homeLabel ?? existing.homeLabel;
-    } else watched.set(d, { gsc: false, homeKey, homeLabel });
+      existing.homeTownLower = town?.toLowerCase() ?? existing.homeTownLower;
+    } else watched.set(d, { gsc: false, homeKey, homeLabel, homeTownLower: town?.toLowerCase() ?? null });
   }
   const watchedTotal = watched.size;
 
@@ -390,18 +399,24 @@ export default async function RankTrackerPage({
   for (const list of rankingsByKeyword.values()) list.sort((a, b) => a.position - b.position);
 
   // Per-keyword rollup: the town's own site vs other network sites (overlap).
+  // Home = same checkpoint as the keyword AND, when the keyword names a
+  // specific town ("lock change brownswood park"), that exact town — so a
+  // sister site sharing the postcode (Finsbury Park, also N4) counts as
+  // overlap there, while generic keywords ("locksmith near me") keep every
+  // site at that checkpoint as home.
   const townOf = (locationName: string) => locationName.split(",")[0].trim().toLowerCase();
   const summarised = keywords.map((k) => {
     const check = latestCheck.get(k.id) ?? null;
     const ranked = rankingsByKeyword.get(k.id) ?? [];
     const town = townOf(k.location_name);
-    const homeDomains = [...watched.entries()]
-      .filter(([, w]) => w.homeKey === town)
-      .map(([d]) => d);
-    const homeSet = new Set(homeDomains);
+    const candidates = [...watched.entries()].filter(([, w]) => w.homeKey === town);
+    const textMatches = candidates.filter(
+      ([, w]) => w.homeTownLower && k.keyword.includes(w.homeTownLower),
+    );
+    const homeSet = new Set((textMatches.length > 0 ? textMatches : candidates).map(([d]) => d));
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && watched.get(r.domain)?.homeKey);
-    return { k, check, ranked, town, hasHome: homeDomains.length > 0, home, overlap };
+    return { k, check, ranked, town, hasHome: homeSet.size > 0, homeSet, home, overlap };
   });
 
   // The text filter narrows EVERYTHING — stat tiles and view counts included —
@@ -593,10 +608,10 @@ export default async function RankTrackerPage({
           </div>
 
           <div className="space-y-3">
-            {visible.slice(0, DISPLAY_CAP).map(({ k, check, ranked, town, hasHome, home, overlap }) => {
+            {visible.slice(0, DISPLAY_CAP).map(({ k, check, ranked, hasHome, homeSet, home, overlap }) => {
               const rankedDomains = new Set(ranked.map((r) => r.domain));
               const notRanking = [...watched.keys()].filter((d) => !rankedDomains.has(d));
-              const isHome = (domain: string) => watched.get(domain)?.homeKey === town;
+              const isHome = (domain: string) => homeSet.has(domain);
               return (
                 <Card key={k.id} className="p-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
