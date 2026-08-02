@@ -42,8 +42,8 @@ export async function GET() {
     all<{ id: string; keyword: string; location_name: string }>((f, t) =>
       supabase!.from("tracked_keywords").select("id, keyword, location_name").eq("organisation_id", orgId).order("keyword").range(f, t),
     ),
-    all<{ domain: string; location: string | null }>((f, t) =>
-      supabase!.from("tracked_domains").select("domain, location").eq("organisation_id", orgId).order("domain").range(f, t),
+    all<{ domain: string; location: string | null; serp_location: string | null }>((f, t) =>
+      supabase!.from("tracked_domains").select("domain, location, serp_location").eq("organisation_id", orgId).order("domain").range(f, t),
     ),
     all<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>((f, t) =>
       supabase!
@@ -80,9 +80,15 @@ export async function GET() {
     rankedBy.set(r.keyword_id, list);
   }
 
-  const homeTown = new Map<string, string>();
+  // homeKey matches domains to keywords checked from their checkpoint
+  // (serp_location when set, town otherwise); label is for display.
+  const homeKey = new Map<string, string>();
+  const homeLabel = new Map<string, string>();
   for (const d of domains) {
-    if (d.location) homeTown.set(normaliseDomain(d.domain), d.location.trim().toLowerCase());
+    const key = (d.serp_location ?? d.location)?.split(",")[0].trim().toLowerCase();
+    if (!key) continue;
+    homeKey.set(normaliseDomain(d.domain), key);
+    homeLabel.set(normaliseDomain(d.domain), (d.location ?? d.serp_location ?? "").trim());
   }
 
   const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];
@@ -100,20 +106,20 @@ export async function GET() {
     const ranked = (rankedBy.get(k.id) ?? []).sort((a, b) => a.position - b.position);
     const rankedSet = new Set(ranked.map((r) => r.domain));
     for (const r of ranked) {
-      const home = homeTown.get(r.domain);
+      const key = homeKey.get(r.domain);
       lines.push(
         [
           esc(k.keyword), esc(k.location_name), check.date, "ranked",
-          esc(r.domain), esc(home ? home : ""), home === town ? "yes" : "no",
+          esc(r.domain), esc(homeLabel.get(r.domain) ?? ""), key === town ? "yes" : "no",
           r.position, esc(r.url),
         ].join(","),
       );
     }
     // The town's own site(s) missing from the top 100.
-    for (const [domain, home] of homeTown) {
-      if (home === town && !rankedSet.has(domain)) {
+    for (const [domain, key] of homeKey) {
+      if (key === town && !rankedSet.has(domain)) {
         lines.push(
-          [esc(k.keyword), esc(k.location_name), check.date, "not_ranking", esc(domain), esc(home), "yes", "", ""].join(","),
+          [esc(k.keyword), esc(k.location_name), check.date, "not_ranking", esc(domain), esc(homeLabel.get(domain) ?? ""), "yes", "", ""].join(","),
         );
       }
     }
