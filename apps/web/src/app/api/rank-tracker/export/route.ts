@@ -90,12 +90,14 @@ export async function GET(request: NextRequest) {
   // (serp_location when set, town otherwise); label is for display.
   const homeKey = new Map<string, string>();
   const homeLabel = new Map<string, string>();
+  const homeTownLower = new Map<string, string>();
   for (const d of domains) {
     const key = (d.serp_location ?? d.location)?.split(",")[0].trim().toLowerCase();
     if (!key) continue;
     const town = d.location?.trim();
     const checkpoint = d.serp_location?.split(",")[0].trim();
     homeKey.set(normaliseDomain(d.domain), key);
+    if (town) homeTownLower.set(normaliseDomain(d.domain), town.toLowerCase());
     homeLabel.set(
       normaliseDomain(d.domain),
       town
@@ -106,16 +108,22 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // Same per-keyword rollup as the dashboard, so view filters match exactly.
+  // Same per-keyword rollup as the dashboard, so view filters match exactly:
+  // a keyword naming a specific town homes only that town's site; sister
+  // sites sharing the checkpoint count as overlap.
   const summarised = keywords.map((k) => {
     const check = latest.get(k.id) ?? null;
     const town = k.location_name.split(",")[0].trim().toLowerCase();
     const ranked = (rankedBy.get(k.id) ?? []).sort((a, b) => a.position - b.position);
-    const homeDomains = [...homeKey.entries()].filter(([, key]) => key === town).map(([d]) => d);
-    const homeSet = new Set(homeDomains);
+    const candidates = [...homeKey.entries()].filter(([, key]) => key === town).map(([d]) => d);
+    const textMatches = candidates.filter((d) => {
+      const t = homeTownLower.get(d);
+      return t && k.keyword.includes(t);
+    });
+    const homeSet = new Set(textMatches.length > 0 ? textMatches : candidates);
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && homeKey.has(r.domain));
-    return { k, check, town, ranked, hasHome: homeDomains.length > 0, homeSet, home, overlap };
+    return { k, check, town, ranked, hasHome: homeSet.size > 0, homeSet, home, overlap };
   });
 
   const filtered = summarised.filter((s) => {
@@ -134,7 +142,7 @@ export async function GET(request: NextRequest) {
   }
 
   const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];
-  for (const { k, check, town, ranked } of filtered) {
+  for (const { k, check, ranked, homeSet } of filtered) {
     if (!check) {
       lines.push([esc(k.keyword), esc(k.location_name), "", "unchecked", "", "", "", "", ""].join(","));
       continue;
@@ -145,18 +153,17 @@ export async function GET(request: NextRequest) {
     }
     const rankedSet = new Set(ranked.map((r) => r.domain));
     for (const r of ranked) {
-      const key = homeKey.get(r.domain);
       lines.push(
         [
           esc(k.keyword), esc(k.location_name), check.date, "ranked",
-          esc(r.domain), esc(homeLabel.get(r.domain) ?? ""), key === town ? "yes" : "no",
+          esc(r.domain), esc(homeLabel.get(r.domain) ?? ""), homeSet.has(r.domain) ? "yes" : "no",
           r.position, esc(r.url),
         ].join(","),
       );
     }
-    // The town's own site(s) missing from the organic top 100.
-    for (const [domain, key] of homeKey) {
-      if (key === town && !rankedSet.has(domain)) {
+    // The keyword's own home site(s) missing from the organic top 100.
+    for (const domain of homeSet) {
+      if (!rankedSet.has(domain)) {
         lines.push(
           [esc(k.keyword), esc(k.location_name), check.date, "not_ranking", esc(domain), esc(homeLabel.get(domain) ?? ""), "yes", "", ""].join(","),
         );
