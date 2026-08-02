@@ -43,36 +43,69 @@ const titleCase = (s: string) =>
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
     .join(" ");
 
-/** Lines of "domain" or "domain <sep> town" where <sep> is a tab (spreadsheet
- * paste), comma, or just spaces. Domains never contain spaces, so everything
- * after the first separator is the town — which itself may contain spaces
- * ("Kingston upon Thames"). */
+/**
+ * Lines of "domain", "domain <sep> town", or "domain <sep> town <sep>
+ * check-from". The town feeds keyword wording; the optional check-from is
+ * where DataForSEO simulates the searcher (postcode district like "BR1", or
+ * any location it recognises). <sep> is a tab or comma; a plain space works
+ * for the two-column form (towns may contain spaces).
+ */
 async function addDomains(formData: FormData) {
   "use server";
   const c = await caller();
   if (!c) return;
-  const rows: { domain: string; location: string | null }[] = [];
-  for (const line of String(formData.get("domains") ?? "").split("\n")) {
-    // Domain = everything up to the first space, tab or comma; the rest is the town.
-    const match = line.trim().match(/^([^\s,]+)[\s,]*(.*)$/);
-    const domain = normaliseDomain(match?.[1] ?? "");
+  const rows: { domain: string; location: string | null; serp: string | null }[] = [];
+  for (const rawLine of String(formData.get("domains") ?? "").split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let domainRaw: string, town: string, serp: string;
+    if (/[\t,]/.test(line)) {
+      const parts = line.split(/[\t,]/).map((p) => p.trim());
+      [domainRaw, town = "", serp = ""] = parts;
+    } else {
+      const match = line.match(/^(\S+)\s*(.*)$/);
+      domainRaw = match?.[1] ?? "";
+      town = (match?.[2] ?? "").trim();
+      serp = "";
+    }
+    const domain = normaliseDomain(domainRaw);
     if (!domain.includes(".")) continue;
-    const location = (match?.[2] ?? "").trim();
-    rows.push({ domain, location: location ? titleCase(location) : null });
+    // Postcode districts ("br1" -> "BR1") uppercase; anything else title-case.
+    const serpFormatted = !serp
+      ? null
+      : /^[a-z]{1,2}\d{1,2}[a-z]?$/i.test(serp)
+        ? serp.toUpperCase()
+        : titleCase(serp);
+    rows.push({ domain, location: town ? titleCase(town) : null, serp: serpFormatted });
   }
   if (rows.length === 0) return;
   const byDomain = new Map(rows.map((r) => [r.domain, r]));
-  // Validate towns against DataForSEO's UK location list (free call) so bad
-  // town names surface at import time, not as failed paid checks later.
+  // Validate checkpoints against DataForSEO's UK location list (free call) so
+  // bad names surface at import time, not as failed paid checks later. Towns
+  // that only exist as "London Borough of X" get resolved automatically.
   const townIndex = await fetchUkTownIndex();
   await c.supabase.from("tracked_domains").upsert(
-    [...byDomain.values()].map((r) => ({
-      organisation_id: c.orgId,
-      domain: r.domain,
-      location: r.location,
-      location_valid:
-        townIndex && r.location ? townIndex.has(r.location.trim().toLowerCase()) : null,
-    })),
+    [...byDomain.values()].map((r) => {
+      let serpLocation = r.serp;
+      let valid: boolean | null = null;
+      if (townIndex) {
+        const checkpoint = (serpLocation ?? r.location ?? "").split(",")[0].trim().toLowerCase();
+        if (checkpoint) {
+          valid = townIndex.has(checkpoint);
+          if (!valid && !serpLocation && r.location && townIndex.has(`london borough of ${checkpoint}`)) {
+            serpLocation = `London Borough of ${r.location}`;
+            valid = true;
+          }
+        }
+      }
+      return {
+        organisation_id: c.orgId,
+        domain: r.domain,
+        location: r.location,
+        serp_location: serpLocation,
+        location_valid: valid,
+      };
+    }),
     { onConflict: "organisation_id,domain" },
   );
   revalidatePath("/rank-tracker");
@@ -94,26 +127,33 @@ async function generateKeywords(formData: FormData) {
   const suffix = String(formData.get("suffix") ?? "").trim() || "England,United Kingdom";
   if (patterns.length === 0) return;
 
-  const domains = await fetchAllRows<{ location: string | null }>((from, to) =>
+  const domains = await fetchAllRows<{ location: string | null; serp_location: string | null }>((from, to) =>
     c.supabase
       .from("tracked_domains")
-      .select("location")
+      .select("location, serp_location")
       .eq("organisation_id", c.orgId)
       .not("location", "is", null)
       .order("id")
       .range(from, to),
   );
-  const towns = [...new Set(domains.map((d) => (d.location as string).trim()).filter(Boolean))];
+  // Keyword wording comes from the town; the SERP is fetched from the town's
+  // checkpoint (serp_location — e.g. "BR1") when one was imported.
+  const checkpointByTown = new Map<string, string>();
+  for (const d of domains) {
+    const town = (d.location as string).trim();
+    if (!town) continue;
+    if (!checkpointByTown.has(town)) checkpointByTown.set(town, d.serp_location?.trim() || town);
+  }
 
   const rows: { organisation_id: string; keyword: string; location_name: string }[] = [];
-  if (towns.length === 0) {
+  if (checkpointByTown.size === 0) {
     for (const p of patterns) {
       if (p.includes("{location}")) continue; // nothing to fill it with
       rows.push({ organisation_id: c.orgId, keyword: p, location_name: "United Kingdom" });
     }
   } else {
-    for (const town of towns) {
-      const locationName = town.includes(",") ? town : `${town},${suffix}`;
+    for (const [town, checkpoint] of checkpointByTown) {
+      const locationName = checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`;
       for (const p of patterns) {
         rows.push({
           organisation_id: c.orgId,
@@ -223,10 +263,10 @@ export default async function RankTrackerPage({
         .order("keyword")
         .range(from, to),
     ),
-    fetchAllRows<{ id: string; domain: string; location: string | null; location_valid: boolean | null }>((from, to) =>
+    fetchAllRows<{ id: string; domain: string; location: string | null; serp_location: string | null; location_valid: boolean | null }>((from, to) =>
       c.supabase
         .from("tracked_domains")
-        .select("id, domain, location, location_valid")
+        .select("id, domain, location, serp_location, location_valid")
         .eq("organisation_id", c.orgId)
         .order("domain")
         .range(from, to),
@@ -235,17 +275,21 @@ export default async function RankTrackerPage({
   ]);
 
   // Watched universe: GSC-connected sites + watch-list, deduped by domain.
-  // homeTown lets the dashboard tell a town's own site from network overlap.
-  const watched = new Map<string, { gsc: boolean; homeTown: string | null }>();
+  // homeKey matches a domain to the keywords checked from its checkpoint
+  // (serp_location when set, town otherwise); homeLabel is the display name.
+  const watched = new Map<string, { gsc: boolean; homeKey: string | null; homeLabel: string | null }>();
   for (const s of sites ?? []) {
-    watched.set(normaliseDomain(s.domain as string), { gsc: true, homeTown: null });
+    watched.set(normaliseDomain(s.domain as string), { gsc: true, homeKey: null, homeLabel: null });
   }
   for (const w of watchDomains) {
     const d = normaliseDomain(w.domain);
-    const homeTown = w.location ? w.location.trim().toLowerCase() : null;
+    const homeKey = (w.serp_location ?? w.location)?.split(",")[0].trim().toLowerCase() || null;
+    const homeLabel = w.location?.trim() || w.serp_location?.trim() || null;
     const existing = watched.get(d);
-    if (existing) existing.homeTown = homeTown ?? existing.homeTown;
-    else watched.set(d, { gsc: false, homeTown });
+    if (existing) {
+      existing.homeKey = homeKey ?? existing.homeKey;
+      existing.homeLabel = homeLabel ?? existing.homeLabel;
+    } else watched.set(d, { gsc: false, homeKey, homeLabel });
   }
   const watchedTotal = watched.size;
 
@@ -311,11 +355,11 @@ export default async function RankTrackerPage({
     const ranked = rankingsByKeyword.get(k.id) ?? [];
     const town = townOf(k.location_name);
     const homeDomains = [...watched.entries()]
-      .filter(([, w]) => w.homeTown === town)
+      .filter(([, w]) => w.homeKey === town)
       .map(([d]) => d);
     const homeSet = new Set(homeDomains);
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
-    const overlap = ranked.filter((r) => !homeSet.has(r.domain) && watched.get(r.domain)?.homeTown);
+    const overlap = ranked.filter((r) => !homeSet.has(r.domain) && watched.get(r.domain)?.homeKey);
     return { k, check, ranked, town, hasHome: homeDomains.length > 0, home, overlap };
   });
 
@@ -408,7 +452,7 @@ export default async function RankTrackerPage({
             {visible.slice(0, DISPLAY_CAP).map(({ k, check, ranked, town, hasHome, home, overlap }) => {
               const rankedDomains = new Set(ranked.map((r) => r.domain));
               const notRanking = [...watched.keys()].filter((d) => !rankedDomains.has(d));
-              const isHome = (domain: string) => watched.get(domain)?.homeTown === town;
+              const isHome = (domain: string) => watched.get(domain)?.homeKey === town;
               return (
                 <Card key={k.id} className="p-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -480,9 +524,9 @@ export default async function RankTrackerPage({
                           })()}
                           <span className="text-ink-2">{r.domain}</span>
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
-                          {!isHome(r.domain) && watched.get(r.domain)?.homeTown && (
+                          {!isHome(r.domain) && watched.get(r.domain)?.homeLabel && (
                             <span className="text-muted">
-                              from {titleCase(watched.get(r.domain)!.homeTown!)}
+                              from {watched.get(r.domain)!.homeLabel}
                             </span>
                           )}
                         </span>
@@ -554,7 +598,7 @@ export default async function RankTrackerPage({
               name="domains"
               required
               rows={6}
-              placeholder={"Paste two spreadsheet columns (domain, town) — one per line:\nbr1locksmithbickley.co.uk\tBickley\nboltfix-locksmiths.co.uk Croydon\nshield-locksmiths.co.uk, Kingston upon Thames"}
+              placeholder={"domain, town — and optionally a third column for WHERE to check from\n(postcode district works best):\nbr1locksmithbickley.co.uk, Bickley, BR1\nboltfix-locksmiths.co.uk, Croydon\nshield-locksmiths.co.uk\tKingston upon Thames\tKT1"}
               className={`${input} w-full font-mono text-xs`}
               aria-label="Domains with towns, one per line"
             />
@@ -562,10 +606,11 @@ export default async function RankTrackerPage({
               Import domains
             </PendingButton>
             <p className="text-xs text-muted">
-              Copy both columns straight from your spreadsheet — tabs, commas or a plain space
-              between domain and town all work (towns may contain spaces).
-              Re-importing a domain updates its town. Protocols, www and paths are stripped.
-              Towns are validated against DataForSEO&rsquo;s location list as you import.
+              The town words the keywords (&ldquo;locksmith bickley&rdquo;); the optional third
+              column is where Google is queried from — a postcode district like BR1 is the most
+              precise and covers small areas DataForSEO has no town entry for. London boroughs
+              (Lewisham, Hackney…) resolve automatically. Tabs, commas or a space all separate
+              columns; re-importing a domain updates it; everything is validated as you import.
             </p>
           </form>
           {watchDomains.some((w) => w.location_valid === false) && (
@@ -574,8 +619,9 @@ export default async function RankTrackerPage({
               {watchDomains.filter((w) => w.location_valid === false).length === 1
                 ? "town isn't a"
                 : "towns aren't"}{" "}
-              recognised DataForSEO location (marked ⚠ below) — re-import those rows with the
-              nearest larger town, e.g. Bickley → Bromley, before generating keywords.
+              recognised DataForSEO location (marked ⚠ below) — re-import those rows with a
+              postcode district as a third column (e.g. &ldquo;domain, Bickley, BR1&rdquo;) before
+              generating keywords. The keyword wording keeps the town; only the checkpoint changes.
             </p>
           )}
           {watchDomains.length > 0 && (
@@ -588,9 +634,10 @@ export default async function RankTrackerPage({
                   <form key={w.id} action={deleteDomain} className="flex items-center justify-between gap-2">
                     <span className="truncate">
                       {w.domain}
-                      {w.location && (
+                      {(w.location || w.serp_location) && (
                         <span className={w.location_valid === false ? "text-critical" : "text-muted"}>
-                          {" "}· {w.location}
+                          {" "}· {w.location ?? w.serp_location}
+                          {w.serp_location && w.location && ` (from ${w.serp_location})`}
                           {w.location_valid === false && " ⚠"}
                         </span>
                       )}
