@@ -272,6 +272,20 @@ export default async function RankTrackerPage({
   const cutoffDate = new Date();
   cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
   const cutoff = cutoffDate.toISOString().slice(0, 10);
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  // In-flight run? Drives the progress banner below.
+  const [{ count: inFlight }, { count: collectedToday }] = await Promise.all([
+    c.supabase
+      .from("serp_task_queue")
+      .select("id", { count: "exact", head: true })
+      .eq("organisation_id", c.orgId),
+    c.supabase
+      .from("serp_checks")
+      .select("id", { count: "exact", head: true })
+      .eq("organisation_id", c.orgId)
+      .eq("check_date", todayStr),
+  ]);
   const [keywords, watchDomains, { data: sites }] = await Promise.all([
     fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
       c.supabase
@@ -389,14 +403,21 @@ export default async function RankTrackerPage({
     return { k, check, ranked, town, hasHome: homeDomains.length > 0, home, overlap };
   });
 
-  const checkedRows = summarised.filter((s) => s.check && !s.check.error);
+  // The text filter narrows EVERYTHING — stat tiles and view counts included —
+  // so filtering to e.g. "plaistow" turns the tiles into that slice's summary.
+  const qFiltered = q
+    ? summarised.filter(
+        (s) => s.k.keyword.includes(q) || s.k.location_name.toLowerCase().includes(q),
+      )
+    : summarised;
+
+  const checkedRows = qFiltered.filter((s) => s.check && !s.check.error);
   const withHome = checkedRows.filter((s) => s.hasHome);
   const homeTop10 = withHome.filter((s) => s.home && s.home.position <= 10).length;
   const homeMissing = withHome.filter((s) => !s.home).length;
   const overlapRows = checkedRows.filter((s) => s.overlap.length > 0).length;
 
-  const visible = summarised.filter((s) => {
-    if (q && !s.k.keyword.includes(q) && !s.k.location_name.toLowerCase().includes(q)) return false;
+  const visible = qFiltered.filter((s) => {
     if (view === "missing") return s.hasHome && s.check && !s.check.error && !s.home;
     if (view === "overlap") return s.overlap.length > 0;
     if (view === "failed") return Boolean(s.check?.error);
@@ -437,9 +458,27 @@ export default async function RankTrackerPage({
         </span>
       </PageHeader>
 
+      {(inFlight ?? 0) > 0 && (
+        <Card className="mb-4 border-series-1/40 p-3 text-sm text-ink">
+          <span className="font-medium">Rank check in progress:</span>{" "}
+          <span className="tnum">
+            {collectedToday ?? 0} of {keywords.length} keywords collected · {inFlight} still
+            processing at DataForSEO.
+          </span>{" "}
+          <span className="text-ink-2">
+            Results land here as they finish (refresh the page to see the latest) — collection
+            continues automatically every few minutes even if you leave or close the tab.
+          </span>
+        </Card>
+      )}
+
       {keywords.length > 0 && (
         <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <StatTile label="Keywords tracked" value={String(keywords.length)} detail={`${checkedRows.length} checked`} />
+          <StatTile
+            label={q ? `Keywords matching “${q}”` : "Keywords tracked"}
+            value={String(qFiltered.length)}
+            detail={q ? `${checkedRows.length} checked · of ${keywords.length} total` : `${checkedRows.length} checked`}
+          />
           <StatTile
             label="Home site in top 10"
             value={withHome.length ? `${homeTop10} / ${withHome.length}` : "—"}

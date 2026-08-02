@@ -31,6 +31,8 @@ export function RankCheckButton({ keywordCount }: { keywordCount: number }) {
         setMessage(
           `${data.checked} of ${data.total} collected · ${data.processing} processing…`,
         );
+        // Stream results onto the dashboard as they land.
+        if (i % 3 === 2) router.refresh();
         // Results arrive over a few minutes — poll gently, not in a tight loop.
         await new Promise((r) => setTimeout(r, 5000));
       }
