@@ -5,8 +5,9 @@
   "account_id": "44799b719f2192a9f066f425aaff3106",
   "main": "worker-entry.mjs",
   "triggers": {
-    // Nightly top-up import + re-analysis, 03:30 UTC.
-    "crons": ["30 3 * * *"]
+    // 03:30 UTC: nightly GSC top-up + re-analysis.
+    // Every 5 min 02:00-05:55 UTC: rank-tracker refresh, one batch per tick.
+    "crons": ["30 3 * * *", "*/5 2-5 * * *"]
   },
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],

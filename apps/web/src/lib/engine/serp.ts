@@ -38,6 +38,32 @@ export function normaliseDomain(raw: string): string {
     .split("?")[0];
 }
 
+/**
+ * First segments ("Bromley", "Croydon", …) of every UK location DataForSEO
+ * accepts, lowercased — used to validate imported towns before any paid
+ * check runs. Returns null when the (free) lookup fails, so callers can
+ * skip validation gracefully.
+ */
+export async function fetchUkTownIndex(): Promise<Set<string> | null> {
+  try {
+    const auth = Buffer.from(
+      `${process.env.DATAFORSEO_LOGIN}:${process.env.DATAFORSEO_PASSWORD}`,
+    ).toString("base64");
+    const res = await fetch("https://api.dataforseo.com/v3/serp/google/locations/GB", {
+      headers: { Authorization: `Basic ${auth}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const out = new Set<string>();
+    for (const l of data.tasks?.[0]?.result ?? []) {
+      if (l.location_name) out.add(String(l.location_name).split(",")[0].trim().toLowerCase());
+    }
+    return out.size > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 interface SerpItem {
   type: string;
   rank_group: number;
