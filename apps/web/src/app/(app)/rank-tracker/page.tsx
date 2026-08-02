@@ -43,18 +43,21 @@ const titleCase = (s: string) =>
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
     .join(" ");
 
-/** Lines of "domain" or "domain, town" (comma or tab separated — a two-column
- * spreadsheet paste arrives tab-separated). */
+/** Lines of "domain" or "domain <sep> town" where <sep> is a tab (spreadsheet
+ * paste), comma, or just spaces. Domains never contain spaces, so everything
+ * after the first separator is the town — which itself may contain spaces
+ * ("Kingston upon Thames"). */
 async function addDomains(formData: FormData) {
   "use server";
   const c = await caller();
   if (!c) return;
   const rows: { domain: string; location: string | null }[] = [];
   for (const line of String(formData.get("domains") ?? "").split("\n")) {
-    const [rawDomain, ...rest] = line.split(/[\t,]/);
-    const domain = normaliseDomain(rawDomain ?? "");
+    // Domain = everything up to the first space, tab or comma; the rest is the town.
+    const match = line.trim().match(/^([^\s,]+)[\s,]*(.*)$/);
+    const domain = normaliseDomain(match?.[1] ?? "");
     if (!domain.includes(".")) continue;
-    const location = rest.join(" ").trim();
+    const location = (match?.[2] ?? "").trim();
     rows.push({ domain, location: location ? titleCase(location) : null });
   }
   if (rows.length === 0) return;
@@ -551,7 +554,7 @@ export default async function RankTrackerPage({
               name="domains"
               required
               rows={6}
-              placeholder={"Paste two spreadsheet columns (domain, town) — one per line:\nbr1locksmithbickley.co.uk\tBickley\nboltfix-locksmiths.co.uk\tCroydon\nshield-locksmiths.co.uk, Bromley"}
+              placeholder={"Paste two spreadsheet columns (domain, town) — one per line:\nbr1locksmithbickley.co.uk\tBickley\nboltfix-locksmiths.co.uk Croydon\nshield-locksmiths.co.uk, Kingston upon Thames"}
               className={`${input} w-full font-mono text-xs`}
               aria-label="Domains with towns, one per line"
             />
@@ -559,7 +562,8 @@ export default async function RankTrackerPage({
               Import domains
             </PendingButton>
             <p className="text-xs text-muted">
-              Copy both columns straight from your spreadsheet — tabs or commas both work.
+              Copy both columns straight from your spreadsheet — tabs, commas or a plain space
+              between domain and town all work (towns may contain spaces).
               Re-importing a domain updates its town. Protocols, www and paths are stripped.
               Towns are validated against DataForSEO&rsquo;s location list as you import.
             </p>
