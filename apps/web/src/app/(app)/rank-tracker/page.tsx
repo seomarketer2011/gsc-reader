@@ -10,7 +10,9 @@ import { SupabaseClient } from "@supabase/supabase-js";
 export const dynamic = "force-dynamic";
 
 const PAGE = 1000; // Supabase caps a single select at 1000 rows
-const DISPLAY_CAP = 300;
+// Cards rendered per page-load; more via the "Show more" link. Kept modest
+// because every card is real DOM — hundreds froze the browser.
+const DISPLAY_STEP = 100;
 
 async function fetchAllRows<T>(
   build: (from: number, to: number) => PromiseLike<{ data: T[] | null }>,
@@ -259,6 +261,8 @@ export default async function RankTrackerPage({
   const q = typeof params.q === "string" ? params.q.trim().toLowerCase() : "";
   const view = typeof params.view === "string" ? params.view : "all";
   const sort = typeof params.sort === "string" ? params.sort : "az";
+  const limit = Math.min(Math.max(Number(params.limit) || DISPLAY_STEP, DISPLAY_STEP), 1000);
+  const openId = typeof params.open === "string" ? params.open : "";
 
   const c = await caller();
   if (!c) {
@@ -608,12 +612,14 @@ export default async function RankTrackerPage({
           </div>
 
           <div className="space-y-3">
-            {visible.slice(0, DISPLAY_CAP).map(({ k, check, ranked, hasHome, homeSet, home, overlap }) => {
+            {visible.slice(0, limit).map(({ k, check, ranked, hasHome, homeSet, home, overlap }) => {
               const rankedDomains = new Set(ranked.map((r) => r.domain));
-              const notRanking = [...watched.keys()].filter((d) => !rankedDomains.has(d));
+              const notRankingCount = watchedTotal - rankedDomains.size;
+              const isOpen = openId === k.id;
               const isHome = (domain: string) => homeSet.has(domain);
               return (
-                <Card key={k.id} className="p-4">
+                <div key={k.id} id={`kw-${k.id}`}>
+                <Card className="p-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <span className="text-sm font-semibold text-ink">{k.keyword}</span>
@@ -699,44 +705,71 @@ export default async function RankTrackerPage({
                     </p>
                   )}
 
-                  {check && !check.error && (
-                    <details className="mt-2.5 text-xs text-ink-2">
-                      <summary className="cursor-pointer select-none text-muted hover:text-ink">
-                        Top of the SERP · {notRanking.length} watched domains not ranking
-                      </summary>
-                      {check.top.length > 0 && (
-                        <ol className="mt-2 space-y-0.5">
-                          {check.top.map((t) => (
-                            <li key={t.position} className="truncate">
-                              <span className="tnum font-medium text-ink">#{t.position}</span>{" "}
-                              <span className={watched.has(t.domain) ? "font-semibold text-series-1" : ""}>
-                                {t.domain}
-                              </span>{" "}
-                              <span className="text-muted">— {t.title}</span>
-                            </li>
-                          ))}
-                        </ol>
-                      )}
-                      {notRanking.length > 0 && (
-                        <div className="mt-2">
-                          <div className="mb-1 font-medium text-ink">Not in the top 100:</div>
-                          <div className="grid gap-x-4 gap-y-0.5 sm:grid-cols-2 lg:grid-cols-4">
-                            {notRanking.map((d) => (
-                              <span key={d} className="truncate text-muted">
-                                {d}
-                              </span>
+                  {check &&
+                    !check.error &&
+                    (isOpen ? (
+                      <div className="mt-2.5 text-xs text-ink-2">
+                        {check.top.length > 0 && (
+                          <ol className="mt-2 space-y-0.5">
+                            {check.top.map((t) => (
+                              <li key={t.position} className="truncate">
+                                <span className="tnum font-medium text-ink">#{t.position}</span>{" "}
+                                <span className={watched.has(t.domain) ? "font-semibold text-series-1" : ""}>
+                                  {t.domain}
+                                </span>{" "}
+                                <span className="text-muted">— {t.title}</span>
+                              </li>
                             ))}
+                          </ol>
+                        )}
+                        <div className="mt-2">
+                          <div className="mb-1 font-medium text-ink">
+                            Not in the top 100 ({notRankingCount}):
+                          </div>
+                          <div className="grid gap-x-4 gap-y-0.5 sm:grid-cols-2 lg:grid-cols-4">
+                            {[...watched.keys()]
+                              .filter((d) => !rankedDomains.has(d))
+                              .map((d) => (
+                                <span key={d} className="truncate text-muted">
+                                  {d}
+                                </span>
+                              ))}
                           </div>
                         </div>
-                      )}
-                    </details>
-                  )}
+                      </div>
+                    ) : (
+                      <Link
+                        href={`/rank-tracker?${new URLSearchParams({
+                          ...(q ? { q } : {}),
+                          ...(view !== "all" ? { view } : {}),
+                          ...(sort !== "az" ? { sort } : {}),
+                          ...(limit !== DISPLAY_STEP ? { limit: String(limit) } : {}),
+                          open: k.id,
+                        })}#kw-${k.id}`}
+                        className="mt-2.5 block text-xs text-muted hover:text-ink"
+                      >
+                        Top of the SERP · {notRankingCount} watched domains not ranking →
+                      </Link>
+                    ))}
                 </Card>
+                </div>
               );
             })}
-            {visible.length > DISPLAY_CAP && (
+            {visible.length > limit && (
               <p className="text-xs text-muted">
-                Showing the first {DISPLAY_CAP} of {visible.length} — use the filter box to narrow down.
+                Showing {limit} of {visible.length} —{" "}
+                <Link
+                  href={`/rank-tracker?${new URLSearchParams({
+                    ...(q ? { q } : {}),
+                    ...(view !== "all" ? { view } : {}),
+                    ...(sort !== "az" ? { sort } : {}),
+                    limit: String(limit + DISPLAY_STEP),
+                  })}`}
+                  className="font-medium text-series-1 hover:underline"
+                >
+                  show {Math.min(DISPLAY_STEP, visible.length - limit)} more
+                </Link>{" "}
+                or use the filter box to narrow down.
               </p>
             )}
           </div>
