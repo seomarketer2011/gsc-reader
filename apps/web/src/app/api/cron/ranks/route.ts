@@ -81,7 +81,7 @@ export async function POST(request: NextRequest) {
         if (toPost.length > 0) posted = await postSerpTasks(service, orgId, toPost);
       }
       const watched = await getWatchedDomains(service, orgId);
-      const { collected, failed, remaining } = await collectSerpResults(service, orgId, watched, 100);
+      const { collected, failed, remaining } = await collectSerpResults(service, orgId, watched, 250);
       if (posted || collected || failed || remaining) {
         summary[orgId.slice(0, 8)] = `posted ${posted}, collected ${collected}, failed ${failed}, in-flight ${remaining}`;
       }
