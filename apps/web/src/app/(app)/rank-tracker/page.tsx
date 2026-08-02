@@ -664,7 +664,7 @@ export default async function RankTrackerPage({
 
                   {ranked.length > 0 && (
                     <div className="mt-2.5 flex flex-wrap gap-1.5">
-                      {ranked.map((r) => (
+                      {(isOpen ? ranked : ranked.slice(0, 20)).map((r) => (
                         <span
                           key={r.domain}
                           title={r.url}
@@ -696,6 +696,11 @@ export default async function RankTrackerPage({
                           )}
                         </span>
                       ))}
+                      {!isOpen && ranked.length > 20 && (
+                        <span className="self-center text-xs text-muted">
+                          +{ranked.length - 20} more in details ↓
+                        </span>
+                      )}
                     </div>
                   )}
                   {overlap.length > 0 && (

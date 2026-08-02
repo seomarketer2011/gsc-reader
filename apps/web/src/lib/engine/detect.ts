@@ -6,6 +6,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { ClusterMember, clusterQueries, locationsFromDomains, QueryClusterAgg } from "./cluster";
 import { getVolumes } from "./volumes";
+import { fetchPaged } from "@/lib/supabase/paged";
 
 interface DetectedOpportunity {
   type: string;
@@ -54,13 +55,19 @@ export async function runDetectors(
     return d.toISOString().slice(0, 10);
   };
 
-  const { data: raw } = await service
-    .from("gsc_performance_daily")
-    .select("date, query, page, clicks, impressions, position")
-    .eq("gsc_property_id", property.id)
-    .gte("date", since(28))
-    .limit(100000);
-  const rows = raw ?? [];
+  const rows = await fetchPaged<{
+    date: string; query: string; page: string; clicks: number; impressions: number; position: number;
+  }>((from, to) =>
+    service
+      .from("gsc_performance_daily")
+      .select("date, query, page, clicks, impressions, position")
+      .eq("gsc_property_id", property.id)
+      .gte("date", since(28))
+      .order("impressions", { ascending: false })
+      .order("date")
+      .order("query")
+      .range(from, to),
+  );
   if (rows.length === 0) return 0;
 
   // Aggregate per query (and track pages + recency alongside).

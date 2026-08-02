@@ -3,6 +3,7 @@
 // to fixtures when no real site exists yet.
 
 import { getServerClient } from "@/lib/supabase/server";
+import { fetchPaged } from "@/lib/supabase/paged";
 import { clusterQueries, locationsFromDomains, QueryClusterAgg } from "@/lib/engine/cluster";
 import { DailyPoint, Opportunity, PageStat, QueryVariation } from "@/lib/types";
 
@@ -113,16 +114,18 @@ async function aggregate(
     d.setUTCDate(d.getUTCDate() - offset);
     return d.toISOString().slice(0, 10);
   };
-  const fetchWindow = async (from: string, to: string) => {
-    const { data } = await supabase
-      .from("gsc_performance_daily")
-      .select(`${dimension}, clicks, impressions, position`)
-      .eq("gsc_property_id", propertyId)
-      .gte("date", from)
-      .lt("date", to)
-      .limit(50000);
-    return (data ?? []) as unknown as Array<Record<string, unknown>>;
-  };
+  const fetchWindow = (from: string, to: string) =>
+    fetchPaged<Record<string, unknown>>((f, t) =>
+      supabase!
+        .from("gsc_performance_daily")
+        .select(`${dimension}, clicks, impressions, position`)
+        .eq("gsc_property_id", propertyId)
+        .gte("date", from)
+        .lt("date", to)
+        .order("impressions", { ascending: false })
+        .order("date")
+        .range(f, t),
+    );
   const [current, previous] = await Promise.all([
     fetchWindow(since(days), since(0)),
     fetchWindow(since(days * 2), since(days)),

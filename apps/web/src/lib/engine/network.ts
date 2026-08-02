@@ -5,6 +5,7 @@
 
 import { SupabaseClient } from "@supabase/supabase-js";
 import { clusterQueries, locationsFromDomains, QueryClusterAgg } from "./cluster";
+import { fetchPaged } from "@/lib/supabase/paged";
 
 export interface NetworkSite {
   siteId: string;
@@ -33,12 +34,18 @@ async function siteClusters(
   extraLocations: Set<string>,
 ): Promise<QueryClusterAgg[]> {
   const cutoff = new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10);
-  const { data } = await service
-    .from("gsc_performance_daily")
-    .select("query, clicks, impressions, position")
-    .eq("gsc_property_id", propertyId)
-    .gte("date", cutoff)
-    .limit(50000);
+  const data = await fetchPaged<{ query: string; clicks: number; impressions: number; position: number }>(
+    (from, to) =>
+      service
+        .from("gsc_performance_daily")
+        .select("query, clicks, impressions, position")
+        .eq("gsc_property_id", propertyId)
+        .gte("date", cutoff)
+        .order("impressions", { ascending: false })
+        .order("date")
+        .order("query")
+        .range(from, to),
+  );
   const byQuery = new Map<string, { clicks: number; impressions: number; posSum: number; n: number }>();
   for (const r of data ?? []) {
     const agg = byQuery.get(r.query as string) ?? { clicks: 0, impressions: 0, posSum: 0, n: 0 };

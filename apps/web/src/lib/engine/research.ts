@@ -3,6 +3,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { normaliseQuery } from "./cluster";
 import { KeywordVolume } from "./volumes";
+import { fetchPaged } from "@/lib/supabase/paged";
 
 export interface ResearchRow {
   keyword: string;
@@ -25,13 +26,19 @@ export async function crossReferenceRankings(
 ): Promise<Map<string, { site: string; impressions: number; position: number }>> {
   const out = new Map<string, { site: string; impressions: number; position: number }>();
   if (keywords.length === 0) return out;
-  const { data } = await service
-    .from("gsc_performance_daily")
-    .select("query, impressions, position, gsc_properties (property_uri)")
-    .eq("organisation_id", orgId)
-    .in("query", keywords)
-    .gte("date", new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10))
-    .limit(20000);
+  const cutoff = new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10);
+  const data = await fetchPaged<Record<string, unknown>>((from, to) =>
+    service
+      .from("gsc_performance_daily")
+      .select("query, impressions, position, gsc_properties (property_uri)")
+      .eq("organisation_id", orgId)
+      .in("query", keywords)
+      .gte("date", cutoff)
+      .order("impressions", { ascending: false })
+      .order("date")
+      .order("query")
+      .range(from, to),
+  );
   const agg = new Map<string, { site: string; impressions: number; posSum: number; n: number }>();
   for (const r of data ?? []) {
     const prop = (Array.isArray(r.gsc_properties) ? r.gsc_properties[0] : r.gsc_properties) as {
