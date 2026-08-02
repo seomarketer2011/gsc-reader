@@ -259,7 +259,12 @@ export async function postSerpTasks(
       }
     }
     if (rows.length > 0) {
-      await service.from("serp_task_queue").upsert(rows, { onConflict: "keyword_id,check_date" });
+      const { error } = await service
+        .from("serp_task_queue")
+        .upsert(rows, { onConflict: "keyword_id,check_date" });
+      // A failed queue write orphans the tasks at DataForSEO — collection
+      // recovers them by tag, but log it loudly.
+      if (error) console.error("serp post: queue upsert failed:", error.message);
       posted += rows.length;
     }
   }
@@ -278,13 +283,18 @@ interface QueueRow {
  * are ready, fetches those results, stores them, and clears the queue rows.
  * Rows older than 20 minutes are polled directly (covers tasks whose "ready"
  * notification was consumed by an earlier crashed run); rows older than 24h
- * are expired. Returns progress counts.
+ * are expired.
+ *
+ * `keywordIds` enables ORPHAN RECOVERY: every task is posted with the
+ * keyword id as its tag, so finished tasks whose queue row was lost (e.g. a
+ * failed queue write) are still claimed and stored. Returns progress counts.
  */
 export async function collectSerpResults(
   service: SupabaseClient,
   orgId: string,
   watched: WatchedDomain[],
   maxTasks = 40,
+  keywordIds?: Set<string>,
 ): Promise<{ collected: number; failed: number; remaining: number }> {
   const queue: QueueRow[] = [];
   for (let from = 0; ; from += QUEUE_PAGE) {
@@ -297,18 +307,28 @@ export async function collectSerpResults(
     queue.push(...((data ?? []) as QueueRow[]));
     if (!data || data.length < QUEUE_PAGE) break;
   }
-  if (queue.length === 0) return { collected: 0, failed: 0, remaining: 0 };
+  if (queue.length === 0 && !keywordIds?.size) return { collected: 0, failed: 0, remaining: 0 };
   const byTaskId = new Map(queue.map((q) => [q.task_id, q]));
 
-  // Which of our tasks are ready?
+  // Which of our tasks are ready? Includes orphans recognised by tag.
   const readyRes = await fetch("https://api.dataforseo.com/v3/serp/google/organic/tasks_ready", {
     headers: { Authorization: `Basic ${dfsAuth()}` },
   });
   const readyIds: string[] = [];
+  const nowIso = new Date().toISOString();
   if (readyRes.ok) {
     const readyData = await readyRes.json();
     for (const r of readyData.tasks?.[0]?.result ?? []) {
-      if (r.id && byTaskId.has(r.id as string)) readyIds.push(r.id as string);
+      const id = r.id as string | undefined;
+      if (!id) continue;
+      if (byTaskId.has(id)) {
+        readyIds.push(id);
+      } else if (r.tag && keywordIds?.has(r.tag as string)) {
+        // Orphan: finished task tagged with one of our keywords but no queue
+        // row — synthesise one in memory so it's collected and stored.
+        byTaskId.set(id, { id: "", keyword_id: r.tag as string, task_id: id, posted_at: nowIso });
+        readyIds.push(id);
+      }
     }
   }
   // Stale rows: poll directly in case their "ready" entry was already consumed.
@@ -351,11 +371,21 @@ export async function collectSerpResults(
     );
   }
 
+  // One result per keyword (a double-posted keyword yields two tasks with
+  // the same tag; the extra queue rows are still cleaned up below).
+  const seenKeyword = new Set<string>();
+  const uniqueSuccesses = successes.filter(
+    (s) => !seenKeyword.has(s.row.keyword_id) && (seenKeyword.add(s.row.keyword_id), true),
+  );
+  const uniqueFailures = failures.filter(
+    (f) => !seenKeyword.has(f.row.keyword_id) && (seenKeyword.add(f.row.keyword_id), true),
+  );
+
   const byDomain = new Map(watched.map((w) => [w.domain, w]));
   const today = new Date().toISOString().slice(0, 10);
   const checkRows: Record<string, unknown>[] = [];
   const rankingRows: Record<string, unknown>[] = [];
-  for (const { row, items } of successes) {
+  for (const { row, items } of uniqueSuccesses) {
     const organic = items.filter((i) => i.type === "organic" && i.domain);
     checkRows.push({
       organisation_id: orgId,
@@ -389,7 +419,7 @@ export async function collectSerpResults(
       });
     }
   }
-  for (const { row, message } of failures) {
+  for (const { row, message } of uniqueFailures) {
     checkRows.push({
       organisation_id: orgId,
       keyword_id: row.keyword_id,
@@ -398,13 +428,23 @@ export async function collectSerpResults(
     });
   }
 
+  // If a checks write fails, keep those queue rows so the results are
+  // re-fetched next pass instead of being lost between the two writes.
   const CHUNK = 100; // keep .in() URLs and payloads comfortable
+  const unwritten = new Set<string>();
   for (let i = 0; i < checkRows.length; i += CHUNK) {
-    await service
+    const slice = checkRows.slice(i, i + CHUNK);
+    const { error } = await service
       .from("serp_checks")
-      .upsert(checkRows.slice(i, i + CHUNK), { onConflict: "keyword_id,check_date" });
+      .upsert(slice, { onConflict: "keyword_id,check_date" });
+    if (error) {
+      console.error("serp collect: checks upsert failed:", error.message);
+      for (const r of slice) unwritten.add(r.keyword_id as string);
+    }
   }
-  const successIds = successes.map((s) => s.row.keyword_id);
+  const successIds = uniqueSuccesses
+    .map((s) => s.row.keyword_id)
+    .filter((id) => !unwritten.has(id));
   for (let i = 0; i < successIds.length; i += CHUNK) {
     await service
       .from("serp_rankings")
@@ -412,19 +452,27 @@ export async function collectSerpResults(
       .in("keyword_id", successIds.slice(i, i + CHUNK))
       .eq("check_date", today);
   }
-  for (let i = 0; i < rankingRows.length; i += CHUNK) {
-    await service.from("serp_rankings").insert(rankingRows.slice(i, i + CHUNK));
+  const writableRankings = rankingRows.filter((r) => !unwritten.has(r.keyword_id as string));
+  for (let i = 0; i < writableRankings.length; i += CHUNK) {
+    const { error } = await service.from("serp_rankings").insert(writableRankings.slice(i, i + CHUNK));
+    if (error) console.error("serp collect: rankings insert failed:", error.message);
   }
-  const doneRowIds = [...successes, ...failures].map((s) => s.row.id);
+  // Clear ALL processed queue rows (including a double-post's extra row);
+  // synthetic orphan rows have no database id to delete.
+  const doneRowIds = [...successes, ...failures]
+    .filter((s) => s.row.id && !unwritten.has(s.row.keyword_id))
+    .map((s) => s.row.id);
   for (let i = 0; i < doneRowIds.length; i += CHUNK) {
     await service.from("serp_task_queue").delete().in("id", doneRowIds.slice(i, i + CHUNK));
   }
 
-  return {
-    collected: successes.length,
-    failed: failures.length,
-    remaining: queue.length - successes.length - failures.length,
-  };
+  const collected = successIds.length;
+  const failedWritten = uniqueFailures.filter((f) => !unwritten.has(f.row.keyword_id)).length;
+  const remaining = Math.max(0, queue.length - doneRowIds.length);
+  console.log(
+    `serp collect: queue=${queue.length} ready=${readyIds.length} stale=${stale.length} fetched=${toFetch.length} collected=${collected} failed=${failedWritten} remaining=${remaining}`,
+  );
+  return { collected, failed: failedWritten, remaining };
 }
 
 /** Union of GSC-connected sites and the plain watch-list, deduped by domain. */

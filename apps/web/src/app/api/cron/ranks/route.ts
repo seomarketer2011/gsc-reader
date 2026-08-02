@@ -81,7 +81,15 @@ export async function POST(request: NextRequest) {
         if (toPost.length > 0) posted = await postSerpTasks(service, orgId, toPost);
       }
       const watched = await getWatchedDomains(service, orgId);
-      const { collected, failed, remaining } = await collectSerpResults(service, orgId, watched, 250);
+      // Keyword ids enable tag-based orphan recovery during collection.
+      const keywordIdRows = await fetchAll<{ id: string }>(service, "tracked_keywords", "id", orgId);
+      const { collected, failed, remaining } = await collectSerpResults(
+        service,
+        orgId,
+        watched,
+        250,
+        new Set(keywordIdRows.map((r) => r.id)),
+      );
       if (posted || collected || failed || remaining) {
         summary[orgId.slice(0, 8)] = `posted ${posted}, collected ${collected}, failed ${failed}, in-flight ${remaining}`;
       }
@@ -89,6 +97,8 @@ export async function POST(request: NextRequest) {
       summary[orgId.slice(0, 8)] = `ERROR: ${e instanceof Error ? e.message.slice(0, 150) : "failed"}`;
     }
   }
+  // Surfaces in `wrangler tail` so cron behaviour is observable.
+  console.log("cron ranks:", JSON.stringify(summary));
   return NextResponse.json({ summary });
 }
 
