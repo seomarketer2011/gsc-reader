@@ -11,12 +11,14 @@ export const maxDuration = 300;
 
 // Rank-tracker queue tick (every 5 minutes, all day):
 // - always COLLECT any finished DataForSEO tasks, so results land within
-//   minutes whether the run was started by the button or the nightly window,
+//   minutes whether the run was started by the button or the sweep window,
 //   and even if the user's tab is long closed;
-// - POST the daily refresh only between 02:00 and 05:59 UTC, so the full
-//   sweep happens overnight. Ticks with nothing to do exit immediately.
+// - POST an automatic sweep only in the overnight window, and only when the
+//   last check is at least SWEEP_INTERVAL_DAYS old (weekly refresh — a
+//   manual button run resets the clock). Idle ticks exit immediately.
 const PAGE = 1000;
 const POST_WINDOW = [2, 3, 4, 5]; // UTC hours
+const SWEEP_INTERVAL_DAYS = 7;
 
 export async function POST(request: NextRequest) {
   const secret = process.env.CRON_SECRET;
@@ -48,7 +50,22 @@ export async function POST(request: NextRequest) {
   for (const orgId of orgIds) {
     try {
       let posted = 0;
+      // Sweep is due when the newest check (manual or automatic) is old enough.
+      let sweepDue = false;
       if (inPostWindow) {
+        const { data: newest } = await service
+          .from("serp_checks")
+          .select("check_date")
+          .eq("organisation_id", orgId)
+          .order("check_date", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        sweepDue =
+          !newest ||
+          (Date.now() - new Date(`${newest.check_date}T00:00:00Z`).getTime()) / 86400000 >=
+            SWEEP_INTERVAL_DAYS;
+      }
+      if (inPostWindow && sweepDue) {
         const [keywords, checkedToday, queued] = await Promise.all([
           fetchAll<{ id: string; keyword: string; location_name: string }>(
             service, "tracked_keywords", "id, keyword, location_name", orgId,
