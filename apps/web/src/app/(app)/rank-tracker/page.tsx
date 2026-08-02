@@ -422,7 +422,7 @@ export default async function RankTrackerPage({
     <div>
       <PageHeader
         title="Rank tracker"
-        subtitle={`Organic Google positions — one SERP check per keyword covers all ${watchedTotal} watched domains at once. Refreshes automatically overnight (02:00–06:00 UTC).`}
+        subtitle={`Organic Google positions — one SERP check per keyword covers all ${watchedTotal} watched domains at once. Sweeps automatically once a week (overnight); the button runs one on demand any time.`}
       >
         <span className="inline-flex items-center gap-2">
           {keywords.length > 0 && (
