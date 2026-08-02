@@ -72,24 +72,52 @@ interface SerpItem {
   title?: string;
 }
 
+/** Transient DataForSEO hiccups (40100-range "internal SE error", 50000+
+ * internal errors, HTTP 5xx, network drops) are retried with backoff —
+ * they usually succeed on the next attempt and failed tasks aren't charged.
+ * Permanent errors (bad location name, auth) throw immediately. */
 async function fetchSerp(keyword: string, locationName: string): Promise<SerpItem[]> {
   const auth = Buffer.from(
     `${process.env.DATAFORSEO_LOGIN}:${process.env.DATAFORSEO_PASSWORD}`,
   ).toString("base64");
-  const res = await fetch("https://api.dataforseo.com/v3/serp/google/organic/live/regular", {
-    method: "POST",
-    headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
-    body: JSON.stringify([
-      { keyword, location_name: locationName, language_name: "English", depth: 100 },
-    ]),
-  });
-  if (!res.ok) throw new Error(`DataForSEO HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = await res.json();
-  const task = data.tasks?.[0];
-  if (task?.status_code !== 20000) {
-    throw new Error(`DataForSEO task ${task?.status_code}: ${task?.status_message}`);
+  let lastTransient: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
+    let res: Response;
+    try {
+      res = await fetch("https://api.dataforseo.com/v3/serp/google/organic/live/regular", {
+        method: "POST",
+        headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
+        body: JSON.stringify([
+          { keyword, location_name: locationName, language_name: "English", depth: 100 },
+        ]),
+      });
+    } catch (e) {
+      lastTransient = e instanceof Error ? e : new Error("network error");
+      continue;
+    }
+    if (!res.ok) {
+      const error = new Error(`DataForSEO HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      if (res.status >= 500) {
+        lastTransient = error;
+        continue;
+      }
+      throw error;
+    }
+    const data = await res.json();
+    const task = data.tasks?.[0];
+    if (task?.status_code !== 20000) {
+      const code = Number(task?.status_code ?? 0);
+      const error = new Error(`DataForSEO task ${code}: ${task?.status_message}`);
+      if ((code >= 40100 && code < 40200) || code >= 50000) {
+        lastTransient = error;
+        continue;
+      }
+      throw error;
+    }
+    return (task.result?.[0]?.items ?? []) as SerpItem[];
   }
-  return (task.result?.[0]?.items ?? []) as SerpItem[];
+  throw lastTransient ?? new Error("SERP fetch failed");
 }
 
 /**

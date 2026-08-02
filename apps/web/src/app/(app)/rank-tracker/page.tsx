@@ -220,6 +220,21 @@ async function deleteAllKeywords() {
   revalidatePath("/rank-tracker");
 }
 
+/** Unlocks today's failed checks so "Check rankings now" retries them. */
+async function retryFailedChecks() {
+  "use server";
+  const c = await caller();
+  if (!c) return;
+  const today = new Date().toISOString().slice(0, 10);
+  await c.supabase
+    .from("serp_checks")
+    .delete()
+    .eq("organisation_id", c.orgId)
+    .eq("check_date", today)
+    .not("error", "is", null);
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteDomain(formData: FormData) {
   "use server";
   const c = await caller();
@@ -447,6 +462,20 @@ export default async function RankTrackerPage({
             {viewLink("missing", "Home site missing", homeMissing)}
             {viewLink("overlap", "Overlap", overlapRows)}
             {viewLink("failed", "Failed checks", summarised.filter((s) => s.check?.error).length)}
+            {(() => {
+              const today = new Date().toISOString().slice(0, 10);
+              const failedToday = checks.filter((r) => r.error && r.check_date === today).length;
+              return failedToday > 0 ? (
+                <form action={retryFailedChecks}>
+                  <PendingButton
+                    pendingLabel="Unlocking…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Retry {failedToday} failed (then press Check rankings now)
+                  </PendingButton>
+                </form>
+              ) : null;
+            })()}
             <form className="ml-auto" method="GET">
               {view !== "all" && <input type="hidden" name="view" value={view} />}
               <input
