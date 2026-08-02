@@ -487,10 +487,18 @@ export default async function RankTrackerPage({
         <span className="inline-flex items-center gap-2">
           {keywords.length > 0 && (
             <a
-              href="/api/rank-tracker/export"
+              href={`/api/rank-tracker/export${(() => {
+                const p = new URLSearchParams({
+                  ...(q ? { q } : {}),
+                  ...(view !== "all" ? { view } : {}),
+                  ...(sort !== "az" ? { sort } : {}),
+                }).toString();
+                return p ? `?${p}` : "";
+              })()}`}
+              title="Exports exactly what you're viewing — filter, view and order included"
               className="rounded-md border border-edge px-3 py-1.5 text-sm font-medium text-ink hover:bg-page"
             >
-              Export CSV
+              Export CSV{q || view !== "all" ? " (filtered)" : ""}
             </a>
           )}
           <RankCheckButton keywordCount={keywords.length} />

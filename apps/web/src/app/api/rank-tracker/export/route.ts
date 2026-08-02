@@ -1,10 +1,13 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getServerClient } from "@/lib/supabase/server";
 import { normaliseDomain, TopResult } from "@/lib/engine/serp";
 
 // CSV of the latest check per keyword: one row per ranked watched domain,
 // plus a row for any home-town domain that is NOT ranking (that absence is
-// the point of the tracker). Uses the caller's session, so RLS scopes it.
+// the point of the tracker — "not ranking" means absent from the organic
+// top 100). Honours the dashboard's current text filter (?q=), view
+// (?view=missing|overlap|failed) and order (?sort=), so exports are custom
+// slices. Uses the caller's session, so RLS scopes it.
 const PAGE = 1000;
 
 function esc(v: string | number | null | undefined): string {
@@ -12,7 +15,10 @@ function esc(v: string | number | null | undefined): string {
   return /[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const q = (request.nextUrl.searchParams.get("q") ?? "").trim().toLowerCase();
+  const view = request.nextUrl.searchParams.get("view") ?? "all";
+  const sort = request.nextUrl.searchParams.get("sort") ?? "az";
   const supabase = await getServerClient();
   const user = supabase ? (await supabase.auth.getUser()).data.user : null;
   if (!user) return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
@@ -100,10 +106,35 @@ export async function GET() {
     );
   }
 
-  const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];
-  for (const k of keywords) {
-    const check = latest.get(k.id);
+  // Same per-keyword rollup as the dashboard, so view filters match exactly.
+  const summarised = keywords.map((k) => {
+    const check = latest.get(k.id) ?? null;
     const town = k.location_name.split(",")[0].trim().toLowerCase();
+    const ranked = (rankedBy.get(k.id) ?? []).sort((a, b) => a.position - b.position);
+    const homeDomains = [...homeKey.entries()].filter(([, key]) => key === town).map(([d]) => d);
+    const homeSet = new Set(homeDomains);
+    const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
+    const overlap = ranked.filter((r) => !homeSet.has(r.domain) && homeKey.has(r.domain));
+    return { k, check, town, ranked, hasHome: homeDomains.length > 0, homeSet, home, overlap };
+  });
+
+  const filtered = summarised.filter((s) => {
+    if (q && !s.k.keyword.includes(q) && !s.k.location_name.toLowerCase().includes(q)) return false;
+    if (view === "missing") return s.hasHome && s.check && !s.check.error && !s.home;
+    if (view === "overlap") return s.overlap.length > 0;
+    if (view === "failed") return Boolean(s.check?.error);
+    return true;
+  });
+  if (sort === "best") {
+    filtered.sort((a, b) => (a.ranked[0]?.position ?? 999) - (b.ranked[0]?.position ?? 999));
+  } else if (sort === "home") {
+    filtered.sort((a, b) => (a.home?.position ?? 999) - (b.home?.position ?? 999));
+  } else if (sort === "sites") {
+    filtered.sort((a, b) => b.ranked.length - a.ranked.length);
+  }
+
+  const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];
+  for (const { k, check, town, ranked } of filtered) {
     if (!check) {
       lines.push([esc(k.keyword), esc(k.location_name), "", "unchecked", "", "", "", "", ""].join(","));
       continue;
@@ -112,7 +143,6 @@ export async function GET() {
       lines.push([esc(k.keyword), esc(k.location_name), check.date, "failed", "", "", "", "", esc(check.error)].join(","));
       continue;
     }
-    const ranked = (rankedBy.get(k.id) ?? []).sort((a, b) => a.position - b.position);
     const rankedSet = new Set(ranked.map((r) => r.domain));
     for (const r of ranked) {
       const key = homeKey.get(r.domain);
@@ -124,7 +154,7 @@ export async function GET() {
         ].join(","),
       );
     }
-    // The town's own site(s) missing from the top 100.
+    // The town's own site(s) missing from the organic top 100.
     for (const [domain, key] of homeKey) {
       if (key === town && !rankedSet.has(domain)) {
         lines.push(
@@ -135,10 +165,13 @@ export async function GET() {
   }
 
   const today = new Date().toISOString().slice(0, 10);
+  const slug = [view !== "all" ? view : "", q ? q.replace(/[^a-z0-9]+/g, "-").slice(0, 30) : ""]
+    .filter(Boolean)
+    .join("-");
   return new NextResponse(lines.join("\n"), {
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="rankings-${today}.csv"`,
+      "Content-Disposition": `attachment; filename="rankings-${today}${slug ? `-${slug}` : ""}.csv"`,
     },
   });
 }
