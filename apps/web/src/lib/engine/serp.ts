@@ -38,13 +38,26 @@ export function normaliseDomain(raw: string): string {
     .split("?")[0];
 }
 
+export interface UkLocationIndex {
+  /** lowercased full location_name -> the canonical spelling */
+  byName: Map<string, string>;
+  /** lowercased first segment ("bickley") -> canonical full names */
+  byTown: Map<string, string[]>;
+}
+
 /**
- * First segments ("Bromley", "Croydon", …) of every UK location DataForSEO
- * accepts, lowercased — used to validate imported towns before any paid
- * check runs. Returns null when the (free) lookup fails, so callers can
- * skip validation gracefully.
+ * Every location DataForSEO will accept for a UK Google search, indexed by
+ * full name ("Bickley,England,United Kingdom") and by first segment.
+ *
+ * This matters more than it looks: DataForSEO matches location_name
+ * EXACTLY. A name it doesn't know fails the check outright, and a name it
+ * knows but that means somewhere else (there are two Richmonds) silently
+ * returns the wrong town's SERP. Resolving against this list before a
+ * keyword is ever stored is what keeps "where was this searched from?"
+ * answerable. The lookup is free. Returns null when it fails, so callers
+ * can carry on without validation rather than block an import.
  */
-export async function fetchUkTownIndex(): Promise<Set<string> | null> {
+export async function fetchUkLocations(): Promise<UkLocationIndex | null> {
   try {
     const auth = Buffer.from(
       `${process.env.DATAFORSEO_LOGIN}:${process.env.DATAFORSEO_PASSWORD}`,
@@ -54,14 +67,68 @@ export async function fetchUkTownIndex(): Promise<Set<string> | null> {
     });
     if (!res.ok) return null;
     const data = await res.json();
-    const out = new Set<string>();
+    const byName = new Map<string, string>();
+    const byTown = new Map<string, string[]>();
     for (const l of data.tasks?.[0]?.result ?? []) {
-      if (l.location_name) out.add(String(l.location_name).split(",")[0].trim().toLowerCase());
+      const name = typeof l.location_name === "string" ? l.location_name.trim() : "";
+      if (!name) continue;
+      byName.set(name.toLowerCase(), name);
+      const town = name.split(",")[0].trim().toLowerCase();
+      const list = byTown.get(town);
+      if (list) list.push(name);
+      else byTown.set(town, [name]);
     }
-    return out.size > 0 ? out : null;
+    return byName.size > 0 ? { byName, byTown } : null;
   } catch {
     return null;
   }
+}
+
+export interface ResolvedLocation {
+  /** What to store and send to DataForSEO — canonical when resolved. */
+  name: string;
+  /** true = a real DataForSEO location, false = it will fail, null = unchecked. */
+  valid: boolean | null;
+  /** Populated when the name matched several places, so the UI can offer them. */
+  alternatives: string[];
+}
+
+/**
+ * Turns what somebody typed ("Bickley", "BR1", "Bromley,England,United
+ * Kingdom") into a location_name DataForSEO accepts. An exact match wins; a
+ * place named without its region resolves when it is unambiguous in the UK;
+ * anything matching several places is reported as ambiguous rather than
+ * guessed at, because guessing means searching from the wrong town.
+ */
+export function resolveLocation(
+  index: UkLocationIndex | null,
+  wanted: string,
+): ResolvedLocation {
+  const raw = wanted.trim();
+  if (!index) return { name: raw, valid: null, alternatives: [] };
+  if (!raw) return { name: raw, valid: false, alternatives: [] };
+
+  const exact = index.byName.get(raw.toLowerCase());
+  if (exact) return { name: exact, valid: true, alternatives: [] };
+
+  // No region, or the wrong one. Boroughs and cities are listed under their
+  // formal names only ("London Borough of Lewisham"), so try those spellings
+  // — but only after the plain name, and never when the plain name already
+  // matched several places.
+  const town = raw.split(",")[0].trim().toLowerCase();
+  const formal = [
+    "london borough of",
+    "royal borough of",
+    "metropolitan borough of",
+    "borough of",
+    "city of",
+  ];
+  for (const key of [town, ...formal.map((p) => `${p} ${town}`)]) {
+    const matches = index.byTown.get(key) ?? [];
+    if (matches.length === 1) return { name: matches[0], valid: true, alternatives: [] };
+    if (matches.length > 1) return { name: raw, valid: false, alternatives: matches.slice(0, 6) };
+  }
+  return { name: raw, valid: false, alternatives: [] };
 }
 
 interface SerpItem {

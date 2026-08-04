@@ -6,10 +6,11 @@ export * from "./.open-next/worker.js";
 const handlers = {
   fetch: worker.fetch,
   async scheduled(controller, env, ctx) {
-    // "30 3 * * *"    → nightly GSC top-up + detectors
-    // "*/5 2-5 * * *" → overnight rank-tracker refresh, one batch per tick
-    const path = controller.cron === "30 3 * * *" ? "/api/cron/daily" : "/api/cron/ranks";
-    const request = new Request(`https://gsc-reader.seomarketer2011.workers.dev${path}`, {
+    // The only scheduled job left: collect finished rank-tracker tasks. It
+    // starts nothing, so no data is refreshed unless you ask for it in the
+    // app. /api/cron/daily still exists and can be POSTed by hand with the
+    // CRON_SECRET header if a nightly GSC top-up is ever wanted again.
+    const request = new Request(`https://gsc-reader.seomarketer2011.workers.dev/api/cron/ranks`, {
       method: "POST",
       headers: { "x-cron-secret": env.CRON_SECRET ?? "" },
     });

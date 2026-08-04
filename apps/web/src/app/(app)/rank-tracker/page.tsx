@@ -5,7 +5,7 @@ import { Badge, Card, EmptyState, PageHeader, StatTile } from "@/components/ui";
 import { PendingButton } from "@/components/PendingButton";
 import { RankCheckButton } from "@/components/RankCheckButton";
 import { getServerClient } from "@/lib/supabase/server";
-import { fetchUkTownIndex, normaliseDomain, TopResult } from "@/lib/engine/serp";
+import { fetchUkLocations, normaliseDomain, resolveLocation, TopResult } from "@/lib/engine/serp";
 import { SupabaseClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
@@ -156,31 +156,24 @@ async function addDomains(formData: FormData) {
   }
   if (rows.length === 0) return;
   const byDomain = new Map(rows.map((r) => [r.domain, r]));
-  // Validate checkpoints against DataForSEO's UK location list (free call) so
-  // bad names surface at import time, not as failed paid checks later. Towns
-  // that only exist as "London Borough of X" get resolved automatically.
-  const townIndex = await fetchUkTownIndex();
+  // Resolve each checkpoint against DataForSEO's UK location list (free call)
+  // and store the canonical full name it gave back — so what gets searched is
+  // settled here, at import time, rather than guessed at when a paid check
+  // runs. Towns that only exist as "London Borough of X" resolve themselves.
+  const locations = await fetchUkLocations();
   await c.supabase.from("tracked_domains").upsert(
     [...byDomain.values()].map((r) => {
-      let serpLocation = r.serp;
-      let valid: boolean | null = null;
-      if (townIndex) {
-        const checkpoint = (serpLocation ?? r.location ?? "").split(",")[0].trim().toLowerCase();
-        if (checkpoint) {
-          valid = townIndex.has(checkpoint);
-          if (!valid && !serpLocation && r.location && townIndex.has(`london borough of ${checkpoint}`)) {
-            serpLocation = `London Borough of ${r.location}`;
-            valid = true;
-          }
-        }
-      }
+      const checkpoint = r.serp ?? r.location;
+      const resolved = checkpoint ? resolveLocation(locations, checkpoint) : null;
       return {
         organisation_id: c.orgId,
         campaign_id: c.campaignId,
         domain: r.domain,
         location: r.location,
-        serp_location: serpLocation,
-        location_valid: valid,
+        // Canonical when it resolved, otherwise exactly what was typed, so
+        // the row still shows what needs correcting.
+        serp_location: resolved ? resolved.name : r.serp,
+        location_valid: resolved ? resolved.valid : null,
       };
     }),
     { onConflict: "campaign_id,domain" },
@@ -230,21 +223,36 @@ async function generateKeywords(formData: FormData) {
     campaign_id: string;
     keyword: string;
     location_name: string;
+    location_valid: boolean | null;
   }[] = [];
   const base = { organisation_id: c.orgId, campaign_id: c.campaignId };
+  const locations = await fetchUkLocations();
   if (pairs.size === 0) {
+    const resolved = resolveLocation(locations, "United Kingdom");
     for (const p of patterns) {
       if (p.includes("{location}")) continue; // nothing to fill it with
-      rows.push({ ...base, keyword: p, location_name: "United Kingdom" });
+      rows.push({
+        ...base,
+        keyword: p,
+        location_name: resolved.name,
+        location_valid: resolved.valid,
+      });
     }
   } else {
     for (const { town, checkpoint } of pairs.values()) {
-      const locationName = checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`;
+      // Imported checkpoints are already canonical full names; anything else
+      // gets the suffix and is resolved here, so every keyword is stored with
+      // the exact location its SERP will be fetched from.
+      const resolved = resolveLocation(
+        locations,
+        checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`,
+      );
       for (const p of patterns) {
         rows.push({
           ...base,
           keyword: p.replaceAll("{location}", town.toLowerCase()).replace(/\s+/g, " ").trim(),
-          location_name: locationName,
+          location_name: resolved.name,
+          location_valid: resolved.valid,
         });
       }
     }
@@ -275,12 +283,17 @@ async function addKeywords(formData: FormData) {
     .map((l) => l.trim().toLowerCase())
     .filter(Boolean);
   if (lines.length === 0) return;
+  // Hand-typed locations get the same resolution as imported ones — this is
+  // the path a single-site campaign uses, and an unrecognised location here
+  // would fail every check in it.
+  const resolved = resolveLocation(await fetchUkLocations(), location);
   await c.supabase.from("tracked_keywords").upsert(
     [...new Set(lines)].map((keyword) => ({
       organisation_id: c.orgId,
       campaign_id: c.campaignId,
       keyword,
-      location_name: location,
+      location_name: resolved.name,
+      location_valid: resolved.valid,
     })),
     { onConflict: "campaign_id,keyword,location_name", ignoreDuplicates: true },
   );
@@ -427,13 +440,14 @@ export default async function RankTrackerPage({
   const todayStr = new Date().toISOString().slice(0, 10);
 
   const [keywords, watchDomains, { data: sites }] = await Promise.all([
-    fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
-      c.supabase
-        .from("tracked_keywords")
-        .select("id, keyword, location_name")
-        .eq("campaign_id", campaignId)
-        .order("keyword")
-        .range(from, to),
+    fetchAllRows<{ id: string; keyword: string; location_name: string; location_valid: boolean | null }>(
+      (from, to) =>
+        c.supabase
+          .from("tracked_keywords")
+          .select("id, keyword, location_name, location_valid")
+          .eq("campaign_id", campaignId)
+          .order("keyword")
+          .range(from, to),
     ),
     fetchAllRows<{ id: string; domain: string; location: string | null; serp_location: string | null; location_valid: boolean | null }>((from, to) =>
       c.supabase
@@ -477,6 +491,11 @@ export default async function RankTrackerPage({
   }
   const watchedTotal = watched.size;
   const gscCount = [...watched.values()].filter((w) => w.gsc).length;
+  // A single-site campaign has one checkpoint; offer it as the default for
+  // hand-added keywords, so they're searched from the site's own area rather
+  // than the whole UK by accident.
+  const checkpoints = [...new Set(watchDomains.map((w) => w.serp_location?.trim()).filter(Boolean))];
+  const defaultLocation = checkpoints.length === 1 ? (checkpoints[0] as string) : "United Kingdom";
 
   // Latest check per keyword (last 30 days) + that day's rankings. Small
   // campaigns ask for their own keywords only; big ones page the org's rows
@@ -734,6 +753,30 @@ export default async function RankTrackerPage({
         </Card>
       )}
 
+      {(() => {
+        // Locations Google will never be asked from. Worth stopping for: the
+        // checks fail rather than returning the wrong town, but a run spent
+        // on them is a run wasted.
+        const bad = keywords.filter((k) => k.location_valid === false);
+        if (bad.length === 0) return null;
+        const names = [...new Set(bad.map((k) => k.location_name))];
+        return (
+          <Card className="mb-4 border-critical/40 p-3 text-sm text-ink">
+            <span className="font-medium text-critical">
+              {bad.length} {bad.length === 1 ? "keyword is" : "keywords are"} set to search from a
+              location DataForSEO doesn&rsquo;t recognise
+            </span>{" "}
+            <span className="text-ink-2">
+              ({names.slice(0, 4).join(" · ")}
+              {names.length > 4 ? ` · +${names.length - 4} more` : ""}) — those checks will fail.
+              Re-import the domain with a postcode district as its third column (e.g.
+              &ldquo;domain, Bickley, BR1&rdquo;) and generate again, or re-add the keywords with a
+              location spelled the way DataForSEO lists it.
+            </span>
+          </Card>
+        );
+      })()}
+
       {keywords.length > 0 && (
         <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
           <StatTile
@@ -820,7 +863,13 @@ export default async function RankTrackerPage({
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <span className="text-sm font-semibold text-ink">{k.keyword}</span>
-                      <span className="ml-2 text-xs text-muted">{k.location_name}</span>
+                      <span
+                        className={`ml-2 text-xs ${k.location_valid === false ? "text-critical" : "text-muted"}`}
+                        title={`Google searched from ${k.location_name}`}
+                      >
+                        from {k.location_name}
+                        {k.location_valid === false && " ⚠ not a DataForSEO location"}
+                      </span>
                     </div>
                     <div className="flex items-center gap-3 text-xs text-ink-2">
                       {check ? (
@@ -1011,6 +1060,38 @@ export default async function RankTrackerPage({
               columns; re-importing a domain updates it; everything is validated as you import.
             </p>
           </form>
+          <details className="mt-3 text-xs text-ink-2">
+            <summary className="cursor-pointer select-none text-muted hover:text-ink">
+              How the search location is decided
+            </summary>
+            <div className="mt-2 space-y-1.5">
+              <p>
+                DataForSEO accepts about 7,700 UK locations and matches the name{" "}
+                <em>exactly</em>. Whatever you type is resolved against that list when you import,
+                and the canonical name it comes back with is what gets stored and searched from —
+                so the location is settled before any check is paid for, not guessed at during one.
+              </p>
+              <p>
+                <span className="font-medium text-ink">Postcode districts are the safest.</span>{" "}
+                BR1, E13, KT1 are all listed and unambiguous. Plenty of real places aren&rsquo;t on
+                the list at all — Bickley, Plaistow and Kingston upon Thames have no entry — so a
+                postcode district is the only way to search from them.
+              </p>
+              <p>
+                <span className="font-medium text-ink">Boroughs resolve themselves.</span>{" "}
+                &ldquo;Lewisham&rdquo; becomes &ldquo;London Borough of Lewisham&rdquo;, and
+                &ldquo;Kensington and Chelsea&rdquo; the Royal Borough — you don&rsquo;t need the
+                long form.
+              </p>
+              <p>
+                <span className="font-medium text-ink">Shared names need spelling out.</span>{" "}
+                Around 785 names cover more than one place (Richmond, Sheffield, Wakefield). Rather
+                than pick one for you, those are flagged as unresolved — give the full form
+                (&ldquo;Richmond,Greater London,England,United Kingdom&rdquo;) or a postcode
+                district instead.
+              </p>
+            </div>
+          </details>
           {watchDomains.some((w) => w.location_valid === false) && (
             <p className="mt-2 text-xs text-critical">
               {watchDomains.filter((w) => w.location_valid === false).length} imported{" "}
@@ -1032,13 +1113,25 @@ export default async function RankTrackerPage({
                   <form key={w.id} action={deleteDomain} className="flex items-center justify-between gap-2">
                     <span className="truncate">
                       {w.domain}
-                      {(w.location || w.serp_location) && (
-                        <span className={w.location_valid === false ? "text-critical" : "text-muted"}>
-                          {" "}· {w.location ?? w.serp_location}
-                          {w.serp_location && w.location && ` (from ${w.serp_location})`}
-                          {w.location_valid === false && " ⚠"}
-                        </span>
-                      )}
+                      {(() => {
+                        // serp_location holds the canonical DataForSEO name;
+                        // only its first segment is worth showing, and only
+                        // when it differs from the town.
+                        const checkpoint = w.serp_location?.split(",")[0].trim();
+                        const town = w.location?.trim();
+                        if (!town && !checkpoint) return null;
+                        const differs = checkpoint && checkpoint.toLowerCase() !== town?.toLowerCase();
+                        return (
+                          <span
+                            className={w.location_valid === false ? "text-critical" : "text-muted"}
+                            title={w.serp_location ? `Searched from ${w.serp_location}` : undefined}
+                          >
+                            {" "}· {town ?? checkpoint}
+                            {town && differs && ` (from ${checkpoint})`}
+                            {w.location_valid === false && " ⚠"}
+                          </span>
+                        );
+                      })()}
                     </span>
                     <input type="hidden" name="id" value={w.id} />
                     <PendingButton pendingLabel="…" className="text-muted hover:text-critical">
@@ -1096,11 +1189,23 @@ export default async function RankTrackerPage({
                 aria-label="Keywords, one per line"
               />
               <div className="flex flex-wrap items-center gap-2">
-                <input name="location" defaultValue="United Kingdom" className={`${input} w-64`} aria-label="Search location" />
+                <input
+                  name="location"
+                  defaultValue={defaultLocation}
+                  className={`${input} w-80`}
+                  aria-label="Search location"
+                  title="Where Google is queried from — resolved against DataForSEO's location list when you add the keywords"
+                />
                 <PendingButton pendingLabel="Adding…" className={primaryBtn}>
                   Add keywords
                 </PendingButton>
               </div>
+              <p className="text-muted">
+                Searched from{" "}
+                <span className="font-medium text-ink">{defaultLocation}</span> unless you change
+                it. A postcode district (BR1) or a borough name works; anything unrecognised is
+                flagged above rather than checked.
+              </p>
             </form>
             <form action={deleteAllKeywords} className="mt-2">
               <input type="hidden" name="campaign" value={campaignId} />

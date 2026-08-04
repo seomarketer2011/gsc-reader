@@ -5,10 +5,14 @@
   "account_id": "44799b719f2192a9f066f425aaff3106",
   "main": "worker-entry.mjs",
   "triggers": {
-    // 03:30 UTC: nightly GSC top-up + re-analysis.
-    // Every 5 min, all day: rank-tracker queue tick — collects finished
-    // DataForSEO tasks any time; posts the daily sweep 02:00-05:59 UTC only.
-    "crons": ["30 3 * * *", "*/5 * * * *"]
+    // Nothing is refreshed automatically — GSC imports, analysis and rank
+    // checks all run from their buttons in the app, when you ask for them.
+    //
+    // The one remaining tick collects finished DataForSEO tasks every 5
+    // minutes. It never starts a check and never spends anything: it only
+    // banks results a check you started has already paid for, so closing
+    // the tab mid-run can't lose them.
+    "crons": ["*/5 * * * *"]
   },
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
