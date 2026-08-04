@@ -13,9 +13,10 @@ export const maxDuration = 300;
 // - always COLLECT any finished DataForSEO tasks, so results land within
 //   minutes whether the run was started by the button or the sweep window,
 //   and even if the user's tab is long closed;
-// - POST an automatic sweep only in the overnight window, and only when the
-//   last check is at least SWEEP_INTERVAL_DAYS old (weekly refresh — a
-//   manual button run resets the clock). Idle ticks exit immediately.
+// - POST an automatic sweep only in the overnight window, and only for
+//   campaigns whose last check is at least SWEEP_INTERVAL_DAYS old (weekly
+//   refresh — a manual button run on a campaign resets that campaign's
+//   clock, and only that one). Idle ticks exit immediately.
 const PAGE = 1000;
 const POST_WINDOW = [2, 3, 4, 5]; // UTC hours
 const SWEEP_INTERVAL_DAYS = 7;
@@ -43,41 +44,35 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  const today = new Date().toISOString().slice(0, 10);
   const inPostWindow = POST_WINDOW.includes(new Date().getUTCHours());
   const summary: Record<string, string> = {};
 
   for (const orgId of orgIds) {
     try {
       let posted = 0;
-      // Sweep is due when the newest check (manual or automatic) is old enough.
-      let sweepDue = false;
       if (inPostWindow) {
-        const { data: newest } = await service
-          .from("serp_checks")
-          .select("check_date")
-          .eq("organisation_id", orgId)
-          .order("check_date", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        sweepDue =
-          !newest ||
-          (Date.now() - new Date(`${newest.check_date}T00:00:00Z`).getTime()) / 86400000 >=
-            SWEEP_INTERVAL_DAYS;
-      }
-      if (inPostWindow && sweepDue) {
-        const [keywords, checkedToday, queued] = await Promise.all([
-          fetchAll<{ id: string; keyword: string; location_name: string }>(
-            service, "tracked_keywords", "id, keyword, location_name", orgId,
+        // A campaign is due when nothing in it has been checked inside the
+        // interval — worked out per campaign, so one client checked by hand
+        // every day doesn't hold the rest of the organisation off its
+        // weekly refresh.
+        const freshFrom = new Date();
+        freshFrom.setUTCDate(freshFrom.getUTCDate() - (SWEEP_INTERVAL_DAYS - 1));
+        const since = freshFrom.toISOString().slice(0, 10);
+        const [keywords, recentChecks, queued] = await Promise.all([
+          fetchAll<{ id: string; keyword: string; location_name: string; campaign_id: string }>(
+            service, "tracked_keywords", "id, keyword, location_name, campaign_id", orgId,
           ),
-          fetchAll<{ keyword_id: string }>(service, "serp_checks", "keyword_id", orgId, today),
+          fetchAll<{ keyword_id: string }>(service, "serp_checks", "keyword_id", orgId, { since }),
           fetchAll<{ keyword_id: string }>(service, "serp_task_queue", "keyword_id", orgId),
         ]);
-        const excluded = new Set([
-          ...checkedToday.map((c) => c.keyword_id),
-          ...queued.map((q) => q.keyword_id),
-        ]);
-        const toPost = keywords.filter((k) => !excluded.has(k.id));
+        const campaignOf = new Map(keywords.map((k) => [k.id, k.campaign_id]));
+        const fresh = new Set<string>();
+        for (const r of recentChecks) {
+          const campaignId = campaignOf.get(r.keyword_id);
+          if (campaignId) fresh.add(campaignId);
+        }
+        const inFlight = new Set(queued.map((q) => q.keyword_id));
+        const toPost = keywords.filter((k) => !fresh.has(k.campaign_id) && !inFlight.has(k.id));
         if (toPost.length > 0) posted = await postSerpTasks(service, orgId, toPost);
       }
       const watched = await getWatchedDomains(service, orgId);
@@ -107,12 +102,13 @@ async function fetchAll<T>(
   table: string,
   columns: string,
   orgId: string,
-  checkDate?: string,
+  dates?: { on?: string; since?: string },
 ): Promise<T[]> {
   const out: T[] = [];
   for (let from = 0; ; from += PAGE) {
     let query = service.from(table).select(columns).eq("organisation_id", orgId);
-    if (checkDate) query = query.eq("check_date", checkDate);
+    if (dates?.on) query = query.eq("check_date", dates.on);
+    if (dates?.since) query = query.gte("check_date", dates.since);
     const { data } = await query.order("organisation_id").range(from, from + PAGE - 1);
     out.push(...((data ?? []) as T[]));
     if (!data || data.length < PAGE) return out;

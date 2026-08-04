@@ -2,12 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerClient } from "@/lib/supabase/server";
 import { normaliseDomain, TopResult } from "@/lib/engine/serp";
 
-// CSV of the latest check per keyword: one row per ranked watched domain,
-// plus a row for any home-town domain that is NOT ranking (that absence is
-// the point of the tracker — "not ranking" means absent from the organic
-// top 100). Honours the dashboard's current text filter (?q=), view
-// (?view=missing|overlap|failed) and order (?sort=), so exports are custom
-// slices. Uses the caller's session, so RLS scopes it.
+// CSV of the latest check per keyword in ONE campaign (?campaign=): one row
+// per ranked watched domain, plus a row for any home-town domain that is NOT
+// ranking (that absence is the point of the tracker — "not ranking" means
+// absent from the organic top 100). Honours the dashboard's current text
+// filter (?q=), view (?view=missing|overlap|failed) and order (?sort=), so
+// exports are custom slices. Uses the caller's session, so RLS scopes it.
 const PAGE = 1000;
 
 function esc(v: string | number | null | undefined): string {
@@ -40,16 +40,38 @@ export async function GET(request: NextRequest) {
     }
   }
 
+  // Export follows the dashboard's selected campaign; without one, the first
+  // campaign, so a hand-typed URL still returns something sensible.
+  const requested = request.nextUrl.searchParams.get("campaign") ?? "";
+  const { data: campaignRow } = await supabase!
+    .from("campaigns")
+    .select("id, name")
+    .eq("organisation_id", orgId)
+    .order("name")
+    .limit(1)
+    .maybeSingle();
+  const { data: chosen } = requested
+    ? await supabase!
+        .from("campaigns")
+        .select("id, name")
+        .eq("id", requested)
+        .eq("organisation_id", orgId)
+        .maybeSingle()
+    : { data: null };
+  const campaign = (chosen ?? campaignRow) as { id: string; name: string } | null;
+  if (!campaign) return NextResponse.json({ error: "no campaign" }, { status: 404 });
+  const campaignId = campaign.id;
+
   const cutoffDate = new Date();
   cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
   const cutoff = cutoffDate.toISOString().slice(0, 10);
 
   const [keywords, domains, checks] = await Promise.all([
     all<{ id: string; keyword: string; location_name: string }>((f, t) =>
-      supabase!.from("tracked_keywords").select("id, keyword, location_name").eq("organisation_id", orgId).order("keyword").range(f, t),
+      supabase!.from("tracked_keywords").select("id, keyword, location_name").eq("campaign_id", campaignId).order("keyword").range(f, t),
     ),
     all<{ domain: string; location: string | null; serp_location: string | null }>((f, t) =>
-      supabase!.from("tracked_domains").select("domain, location, serp_location").eq("organisation_id", orgId).order("domain").range(f, t),
+      supabase!.from("tracked_domains").select("domain, location, serp_location").eq("campaign_id", campaignId).order("domain").range(f, t),
     ),
     all<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>((f, t) =>
       supabase!
@@ -62,8 +84,10 @@ export async function GET(request: NextRequest) {
     ),
   ]);
 
+  const keywordIds = new Set(keywords.map((k) => k.id));
   const latest = new Map<string, { date: string; error: string | null }>();
   for (const row of checks) {
+    if (!keywordIds.has(row.keyword_id)) continue; // another campaign's check
     if (!latest.has(row.keyword_id)) latest.set(row.keyword_id, { date: row.check_date, error: row.error });
   }
   const latestDates = [...new Set([...latest.values()].map((v) => v.date))];
@@ -78,8 +102,12 @@ export async function GET(request: NextRequest) {
           .range(f, t),
       )
     : [];
+  // Rankings are recorded for every domain the organisation watches, so rows
+  // for other campaigns' domains are filtered out here.
+  const campaignDomains = new Set(domains.map((d) => normaliseDomain(d.domain)));
   const rankedBy = new Map<string, { domain: string; position: number; url: string }[]>();
   for (const r of rankings) {
+    if (!campaignDomains.has(r.domain)) continue;
     if (r.check_date !== latest.get(r.keyword_id)?.date) continue;
     const list = rankedBy.get(r.keyword_id) ?? [];
     list.push({ domain: r.domain, position: r.position, url: r.url ?? "" });
@@ -172,7 +200,11 @@ export async function GET(request: NextRequest) {
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const slug = [view !== "all" ? view : "", q ? q.replace(/[^a-z0-9]+/g, "-").slice(0, 30) : ""]
+  const slug = [
+    campaign.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40),
+    view !== "all" ? view : "",
+    q ? q.replace(/[^a-z0-9]+/g, "-").slice(0, 30) : "",
+  ]
     .filter(Boolean)
     .join("-");
   return new NextResponse(lines.join("\n"), {

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { Badge, Card, EmptyState, PageHeader, StatTile } from "@/components/ui";
 import { PendingButton } from "@/components/PendingButton";
@@ -13,6 +14,12 @@ const PAGE = 1000; // Supabase caps a single select at 1000 rows
 // Cards rendered per page-load; more via the "Show more" link. Kept modest
 // because every card is real DOM — hundreds froze the browser.
 const DISPLAY_STEP = 100;
+// Below this many keywords it is far cheaper to ask for exactly a campaign's
+// keywords than to pull the organisation's whole history and filter it in
+// memory. Kept low because the ids travel in the request URL — a small
+// campaign (the common case) costs one tiny query instead of paging tens of
+// thousands of rows; bigger ones fall back to the org-wide fetch.
+const SCOPED_MAX = 100;
 
 async function fetchAllRows<T>(
   build: (from: number, to: number) => PromiseLike<{ data: T[] | null }>,
@@ -39,11 +46,78 @@ async function caller(): Promise<{ supabase: SupabaseClient; orgId: string } | n
   return membership ? { supabase, orgId: membership.organisation_id as string } : null;
 }
 
+/** Campaign id from a form, verified to belong to the caller's org — every
+ * write lands inside one campaign, so a stale or forged id must not slip
+ * rows into someone else's list. */
+async function callerCampaign(
+  formData: FormData,
+): Promise<{ supabase: SupabaseClient; orgId: string; campaignId: string } | null> {
+  const c = await caller();
+  const campaignId = String(formData.get("campaign") ?? "");
+  if (!c || !campaignId) return null;
+  const { data } = await c.supabase
+    .from("campaigns")
+    .select("id")
+    .eq("id", campaignId)
+    .eq("organisation_id", c.orgId)
+    .maybeSingle();
+  return data ? { ...c, campaignId } : null;
+}
+
 const titleCase = (s: string) =>
   s
     .split(/\s+/)
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
     .join(" ");
+
+/** Campaigns are the tracker's unit of work: each owns its own domains and
+ * keywords, and a check runs one campaign only. Same table as the site
+ * groups on /sites, so a group can double as a tracker campaign. */
+async function createCampaign(formData: FormData) {
+  "use server";
+  const c = await caller();
+  const name = String(formData.get("name") ?? "").trim().slice(0, 80);
+  if (!c || !name) return;
+  // Idempotent by name, like site groups: a double submit selects the
+  // existing campaign rather than failing on the unique index.
+  const { data: existing } = await c.supabase
+    .from("campaigns")
+    .select("id")
+    .eq("organisation_id", c.orgId)
+    .eq("name", name)
+    .maybeSingle();
+  let id = existing?.id as string | undefined;
+  if (!id) {
+    const { data } = await c.supabase
+      .from("campaigns")
+      .insert({ organisation_id: c.orgId, name })
+      .select("id")
+      .single();
+    id = data?.id as string | undefined;
+  }
+  revalidatePath("/", "layout"); // campaigns also feed the global View selector
+  if (id) redirect(`/rank-tracker?campaign=${id}`);
+}
+
+async function renameCampaign(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  const name = String(formData.get("name") ?? "").trim().slice(0, 80);
+  if (!c || !name) return;
+  await c.supabase.from("campaigns").update({ name }).eq("id", c.campaignId);
+  revalidatePath("/", "layout");
+}
+
+/** Deletes the campaign and, by cascade, its domains, keywords and their
+ * ranking history. The page falls back to the first remaining campaign. */
+async function deleteCampaign(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  await c.supabase.from("campaigns").delete().eq("id", c.campaignId);
+  revalidatePath("/", "layout");
+  redirect("/rank-tracker");
+}
 
 /**
  * Lines of "domain", "domain <sep> town", or "domain <sep> town <sep>
@@ -54,7 +128,7 @@ const titleCase = (s: string) =>
  */
 async function addDomains(formData: FormData) {
   "use server";
-  const c = await caller();
+  const c = await callerCampaign(formData);
   if (!c) return;
   const rows: { domain: string; location: string | null; serp: string | null }[] = [];
   for (const rawLine of String(formData.get("domains") ?? "").split("\n")) {
@@ -102,24 +176,25 @@ async function addDomains(formData: FormData) {
       }
       return {
         organisation_id: c.orgId,
+        campaign_id: c.campaignId,
         domain: r.domain,
         location: r.location,
         serp_location: serpLocation,
         location_valid: valid,
       };
     }),
-    { onConflict: "organisation_id,domain" },
+    { onConflict: "campaign_id,domain" },
   );
   revalidatePath("/rank-tracker");
 }
 
-/** Expands keyword patterns across every imported town. "{location}" in a
- * pattern becomes the town name; every generated keyword is checked FROM its
- * town. Patterns without the placeholder (e.g. "locksmith near me") are
+/** Expands keyword patterns across every town in this campaign. "{location}"
+ * in a pattern becomes the town name; every generated keyword is checked FROM
+ * its town. Patterns without the placeholder (e.g. "locksmith near me") are
  * generated once per town too — that's the point of local checking. */
 async function generateKeywords(formData: FormData) {
   "use server";
-  const c = await caller();
+  const c = await callerCampaign(formData);
   if (!c) return;
   const patterns = String(formData.get("patterns") ?? "")
     .split("\n")
@@ -133,7 +208,7 @@ async function generateKeywords(formData: FormData) {
     c.supabase
       .from("tracked_domains")
       .select("location, serp_location")
-      .eq("organisation_id", c.orgId)
+      .eq("campaign_id", c.campaignId)
       .not("location", "is", null)
       .order("id")
       .range(from, to),
@@ -150,18 +225,24 @@ async function generateKeywords(formData: FormData) {
     pairs.set(`${town.toLowerCase()}|${checkpoint.toLowerCase()}`, { town, checkpoint });
   }
 
-  const rows: { organisation_id: string; keyword: string; location_name: string }[] = [];
+  const rows: {
+    organisation_id: string;
+    campaign_id: string;
+    keyword: string;
+    location_name: string;
+  }[] = [];
+  const base = { organisation_id: c.orgId, campaign_id: c.campaignId };
   if (pairs.size === 0) {
     for (const p of patterns) {
       if (p.includes("{location}")) continue; // nothing to fill it with
-      rows.push({ organisation_id: c.orgId, keyword: p, location_name: "United Kingdom" });
+      rows.push({ ...base, keyword: p, location_name: "United Kingdom" });
     }
   } else {
     for (const { town, checkpoint } of pairs.values()) {
       const locationName = checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`;
       for (const p of patterns) {
         rows.push({
-          organisation_id: c.orgId,
+          ...base,
           keyword: p.replaceAll("{location}", town.toLowerCase()).replace(/\s+/g, " ").trim(),
           location_name: locationName,
         });
@@ -177,7 +258,7 @@ async function generateKeywords(formData: FormData) {
   });
   for (let i = 0; i < unique.length; i += PAGE) {
     await c.supabase.from("tracked_keywords").upsert(unique.slice(i, i + PAGE), {
-      onConflict: "organisation_id,keyword,location_name",
+      onConflict: "campaign_id,keyword,location_name",
       ignoreDuplicates: true,
     });
   }
@@ -186,7 +267,7 @@ async function generateKeywords(formData: FormData) {
 
 async function addKeywords(formData: FormData) {
   "use server";
-  const c = await caller();
+  const c = await callerCampaign(formData);
   if (!c) return;
   const location = String(formData.get("location") ?? "").trim() || "United Kingdom";
   const lines = String(formData.get("keywords") ?? "")
@@ -197,10 +278,11 @@ async function addKeywords(formData: FormData) {
   await c.supabase.from("tracked_keywords").upsert(
     [...new Set(lines)].map((keyword) => ({
       organisation_id: c.orgId,
+      campaign_id: c.campaignId,
       keyword,
       location_name: location,
     })),
-    { onConflict: "organisation_id,keyword,location_name", ignoreDuplicates: true },
+    { onConflict: "campaign_id,keyword,location_name", ignoreDuplicates: true },
   );
   revalidatePath("/rank-tracker");
 }
@@ -214,26 +296,41 @@ async function deleteKeyword(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
-async function deleteAllKeywords() {
+async function deleteAllKeywords(formData: FormData) {
   "use server";
-  const c = await caller();
+  const c = await callerCampaign(formData);
   if (!c) return;
-  await c.supabase.from("tracked_keywords").delete().eq("organisation_id", c.orgId);
+  await c.supabase.from("tracked_keywords").delete().eq("campaign_id", c.campaignId);
   revalidatePath("/rank-tracker");
 }
 
-/** Unlocks today's failed checks so "Check rankings now" retries them. */
-async function retryFailedChecks() {
+/** Unlocks this campaign's failed checks for today so "Check rankings now"
+ * retries them. serp_checks hangs off keywords, so the campaign filter is a
+ * keyword-id list — chunked to keep the request URL sane. */
+async function retryFailedChecks(formData: FormData) {
   "use server";
-  const c = await caller();
+  const c = await callerCampaign(formData);
   if (!c) return;
   const today = new Date().toISOString().slice(0, 10);
-  await c.supabase
-    .from("serp_checks")
-    .delete()
-    .eq("organisation_id", c.orgId)
-    .eq("check_date", today)
-    .not("error", "is", null);
+  const keywordIds = await fetchAllRows<{ id: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("id")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  for (let i = 0; i < keywordIds.length; i += 100) {
+    await c.supabase
+      .from("serp_checks")
+      .delete()
+      .eq("check_date", today)
+      .not("error", "is", null)
+      .in(
+        "keyword_id",
+        keywordIds.slice(i, i + 100).map((k) => k.id),
+      );
+  }
   revalidatePath("/rank-tracker");
 }
 
@@ -274,29 +371,67 @@ export default async function RankTrackerPage({
     );
   }
 
+  const input =
+    "rounded-md border border-edge bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-1 focus:ring-series-1";
+  const primaryBtn =
+    "rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90";
+
+  const { data: campaignRows } = await c.supabase
+    .from("campaigns")
+    .select("id, name")
+    .eq("organisation_id", c.orgId)
+    .order("name");
+  const campaigns = (campaignRows ?? []) as { id: string; name: string }[];
+  const requested = typeof params.campaign === "string" ? params.campaign : "";
+  const campaign = campaigns.find((x) => x.id === requested) ?? campaigns[0] ?? null;
+
+  const newCampaignForm = (
+    <form action={createCampaign} className="flex flex-wrap items-center gap-2">
+      <input
+        name="name"
+        required
+        maxLength={80}
+        placeholder="Campaign name (e.g. Bickley Locksmiths)"
+        className={`${input} w-72`}
+        aria-label="New campaign name"
+      />
+      <PendingButton pendingLabel="Creating…" className={primaryBtn}>
+        Create campaign
+      </PendingButton>
+    </form>
+  );
+
+  if (!campaign) {
+    return (
+      <div>
+        <PageHeader
+          title="Rank tracker"
+          subtitle="Organic Google positions, one campaign at a time. A campaign holds its own domains and keywords, and a check only ever runs the campaign you're looking at — so tracking one client costs one client's worth of checks."
+        />
+        <Card className="p-4">
+          <div className="mb-2 text-sm font-medium text-ink">Create your first campaign</div>
+          {newCampaignForm}
+          <p className="mt-2 text-xs text-muted">
+            One campaign per client, network or experiment. You can add as many as you like and
+            switch between them here; each keeps its own domains, keywords and ranking history.
+          </p>
+        </Card>
+      </div>
+    );
+  }
+  const campaignId = campaign.id;
+
   const cutoffDate = new Date();
   cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
   const cutoff = cutoffDate.toISOString().slice(0, 10);
   const todayStr = new Date().toISOString().slice(0, 10);
 
-  // In-flight run? Drives the progress banner below.
-  const [{ count: inFlight }, { count: collectedToday }] = await Promise.all([
-    c.supabase
-      .from("serp_task_queue")
-      .select("id", { count: "exact", head: true })
-      .eq("organisation_id", c.orgId),
-    c.supabase
-      .from("serp_checks")
-      .select("id", { count: "exact", head: true })
-      .eq("organisation_id", c.orgId)
-      .eq("check_date", todayStr),
-  ]);
   const [keywords, watchDomains, { data: sites }] = await Promise.all([
     fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
       c.supabase
         .from("tracked_keywords")
         .select("id, keyword, location_name")
-        .eq("organisation_id", c.orgId)
+        .eq("campaign_id", campaignId)
         .order("keyword")
         .range(from, to),
     ),
@@ -304,28 +439,23 @@ export default async function RankTrackerPage({
       c.supabase
         .from("tracked_domains")
         .select("id, domain, location, serp_location, location_valid")
-        .eq("organisation_id", c.orgId)
+        .eq("campaign_id", campaignId)
         .order("domain")
         .range(from, to),
     ),
     c.supabase.from("sites").select("id, domain").eq("organisation_id", c.orgId),
   ]);
+  const keywordIds = new Set(keywords.map((k) => k.id));
 
-  // Watched universe: GSC-connected sites + watch-list, deduped by domain.
-  // homeKey matches a domain to the keywords checked from its checkpoint
-  // (serp_location when set, town otherwise); homeLabel is the display name.
+  // Watched universe: exactly this campaign's domains. gsc marks the ones
+  // that are also GSC-connected sites. homeKey matches a domain to the
+  // keywords checked from its checkpoint (serp_location when set, town
+  // otherwise); homeLabel is the display name.
+  const gscDomains = new Set((sites ?? []).map((s) => normaliseDomain(s.domain as string)));
   const watched = new Map<
     string,
     { gsc: boolean; homeKey: string | null; homeLabel: string | null; homeTownLower: string | null }
   >();
-  for (const s of sites ?? []) {
-    watched.set(normaliseDomain(s.domain as string), {
-      gsc: true,
-      homeKey: null,
-      homeLabel: null,
-      homeTownLower: null,
-    });
-  }
   for (const w of watchDomains) {
     const d = normaliseDomain(w.domain);
     const homeKey = (w.serp_location ?? w.location)?.split(",")[0].trim().toLowerCase() || null;
@@ -338,28 +468,59 @@ export default async function RankTrackerPage({
         ? `${town} (${checkpoint})`
         : town
       : checkpoint || null;
-    const existing = watched.get(d);
-    if (existing) {
-      existing.homeKey = homeKey ?? existing.homeKey;
-      existing.homeLabel = homeLabel ?? existing.homeLabel;
-      existing.homeTownLower = town?.toLowerCase() ?? existing.homeTownLower;
-    } else watched.set(d, { gsc: false, homeKey, homeLabel, homeTownLower: town?.toLowerCase() ?? null });
+    watched.set(d, {
+      gsc: gscDomains.has(d),
+      homeKey,
+      homeLabel,
+      homeTownLower: town?.toLowerCase() ?? null,
+    });
   }
   const watchedTotal = watched.size;
+  const gscCount = [...watched.values()].filter((w) => w.gsc).length;
 
-  // Latest check per keyword (last 30 days) + that day's rankings.
-  const checks = keywords.length
-    ? await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
-        (from, to) =>
-          c.supabase
-            .from("serp_checks")
-            .select("keyword_id, check_date, error, top_results")
-            .eq("organisation_id", c.orgId)
-            .gte("check_date", cutoff)
-            .order("check_date", { ascending: false })
-            .range(from, to),
+  // Latest check per keyword (last 30 days) + that day's rankings. Small
+  // campaigns ask for their own keywords only; big ones page the org's rows
+  // and filter, which is cheaper than a very long `in` list.
+  const checks = !keywords.length
+    ? []
+    : keywords.length <= SCOPED_MAX
+      ? await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
+          (from, to) =>
+            c.supabase
+              .from("serp_checks")
+              .select("keyword_id, check_date, error, top_results")
+              .in("keyword_id", [...keywordIds])
+              .gte("check_date", cutoff)
+              .order("check_date", { ascending: false })
+              .range(from, to),
+        )
+      : (
+          await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
+            (from, to) =>
+              c.supabase
+                .from("serp_checks")
+                .select("keyword_id, check_date, error, top_results")
+                .eq("organisation_id", c.orgId)
+                .gte("check_date", cutoff)
+                .order("check_date", { ascending: false })
+                .range(from, to),
+          )
+        ).filter((r) => keywordIds.has(r.keyword_id));
+
+  // In-flight tasks for THIS campaign — drives the progress banner below.
+  const queued = keywords.length
+    ? await fetchAllRows<{ keyword_id: string }>((from, to) =>
+        c.supabase
+          .from("serp_task_queue")
+          .select("keyword_id")
+          .eq("organisation_id", c.orgId)
+          .order("keyword_id")
+          .range(from, to),
       )
     : [];
+  const inFlight = queued.filter((r) => keywordIds.has(r.keyword_id)).length;
+  const collectedToday = checks.filter((r) => r.check_date === todayStr).length;
+
   const latestCheck = new Map<string, { date: string; error: string | null; top: TopResult[] }>();
   const prevCheckDate = new Map<string, string>(); // keyword -> the check before the latest
   for (const row of checks) {
@@ -377,20 +538,31 @@ export default async function RankTrackerPage({
     ...new Set([...[...latestCheck.values()].map((v) => v.date), ...prevCheckDate.values()]),
   ];
   const rankings = latestDates.length
-    ? await fetchAllRows<{ keyword_id: string; domain: string; position: number; url: string | null; check_date: string }>(
-        (from, to) =>
-          c.supabase
-            .from("serp_rankings")
-            .select("keyword_id, domain, position, url, check_date")
-            .eq("organisation_id", c.orgId)
-            .in("check_date", latestDates)
-            .order("id")
-            .range(from, to),
-      )
+    ? (
+        await fetchAllRows<{ keyword_id: string; domain: string; position: number; url: string | null; check_date: string }>(
+          (from, to) => {
+            const query = c.supabase
+              .from("serp_rankings")
+              .select("keyword_id, domain, position, url, check_date");
+            return (
+              keywords.length <= SCOPED_MAX
+                ? query.in("keyword_id", [...keywordIds])
+                : query.eq("organisation_id", c.orgId)
+            )
+              .in("check_date", latestDates)
+              .order("id")
+              .range(from, to);
+          },
+        )
+      ).filter((r) => keywordIds.has(r.keyword_id))
     : [];
   const rankingsByKeyword = new Map<string, { domain: string; position: number; url: string }[]>();
   const prevPosition = new Map<string, number>(); // "keywordId|domain" -> previous position
   for (const r of rankings) {
+    // Rankings are recorded for every domain the organisation watches, so a
+    // sister campaign's domains show up here — this campaign only cares
+    // about its own.
+    if (!watched.has(r.domain)) continue;
     if (r.check_date === prevCheckDate.get(r.keyword_id)) {
       prevPosition.set(`${r.keyword_id}|${r.domain}`, r.position);
       continue;
@@ -402,7 +574,7 @@ export default async function RankTrackerPage({
   }
   for (const list of rankingsByKeyword.values()) list.sort((a, b) => a.position - b.position);
 
-  // Per-keyword rollup: the town's own site vs other network sites (overlap).
+  // Per-keyword rollup: the town's own site vs other campaign sites (overlap).
   // Home = same checkpoint as the keyword AND, when the keyword names a
   // specific town ("lock change brownswood park"), that exact town — so a
   // sister site sharing the postcode (Finsbury Park, also N4) counts as
@@ -463,8 +635,10 @@ export default async function RankTrackerPage({
     );
   }
 
+  // Every link keeps the selected campaign — it is the page's outermost scope.
   const linkParams = (overrides: Record<string, string>) => {
     const merged: Record<string, string> = {
+      campaign: campaignId,
       ...(q ? { q } : {}),
       ...(view !== "all" ? { view } : {}),
       ...(sort !== "az" ? { sort } : {}),
@@ -492,44 +666,66 @@ export default async function RankTrackerPage({
     </Link>
   );
 
-  const input =
-    "rounded-md border border-edge bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-1 focus:ring-series-1";
-  const primaryBtn =
-    "rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90";
-
   return (
     <div>
       <PageHeader
         title="Rank tracker"
-        subtitle={`Organic Google positions — one SERP check per keyword covers all ${watchedTotal} watched domains at once. Sweeps automatically once a week (overnight); the button runs one on demand any time.`}
+        subtitle={`${campaign.name} — one SERP check per keyword covers all ${watchedTotal} domains in this campaign at once. Checks run this campaign only; the weekly overnight sweep refreshes every campaign.`}
       >
         <span className="inline-flex items-center gap-2">
           {keywords.length > 0 && (
             <a
               href={`/api/rank-tracker/export${(() => {
                 const p = new URLSearchParams({
+                  campaign: campaignId,
                   ...(q ? { q } : {}),
                   ...(view !== "all" ? { view } : {}),
                   ...(sort !== "az" ? { sort } : {}),
                 }).toString();
                 return p ? `?${p}` : "";
               })()}`}
-              title="Exports exactly what you're viewing — filter, view and order included"
+              title="Exports exactly what you're viewing — campaign, filter, view and order included"
               className="rounded-md border border-edge px-3 py-1.5 text-sm font-medium text-ink hover:bg-page"
             >
               Export CSV{q || view !== "all" ? " (filtered)" : ""}
             </a>
           )}
-          <RankCheckButton keywordCount={keywords.length} />
+          <RankCheckButton keywordCount={keywords.length} campaignId={campaignId} />
         </span>
       </PageHeader>
 
-      {(inFlight ?? 0) > 0 && (
+      {/* ── Campaign switcher ── */}
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
+        <span className="text-muted">Campaign</span>
+        {campaigns.map((x) => (
+          <Link
+            key={x.id}
+            href={`/rank-tracker?campaign=${x.id}`}
+            className={`rounded-md border px-2 py-1 ${
+              x.id === campaignId
+                ? "border-series-1 bg-page font-medium text-series-1"
+                : "border-edge text-ink-2 hover:text-ink"
+            }`}
+          >
+            {x.name}
+          </Link>
+        ))}
+        <details className="relative">
+          <summary className="cursor-pointer select-none rounded-md border border-edge px-2 py-1 text-muted hover:text-ink">
+            + New
+          </summary>
+          <div className="absolute left-0 z-10 mt-1 w-max rounded-md border border-edge bg-surface p-3 shadow-lg">
+            {newCampaignForm}
+          </div>
+        </details>
+      </div>
+
+      {inFlight > 0 && (
         <Card className="mb-4 border-series-1/40 p-3 text-sm text-ink">
           <span className="font-medium">Rank check in progress:</span>{" "}
           <span className="tnum">
-            {collectedToday ?? 0} of {keywords.length} keywords collected · {inFlight} still
-            processing at DataForSEO.
+            {collectedToday} of {keywords.length} keywords collected · {inFlight} still processing
+            at DataForSEO.
           </span>{" "}
           <span className="text-ink-2">
             Results land here as they finish (refresh the page to see the latest) — collection
@@ -551,14 +747,14 @@ export default async function RankTrackerPage({
             detail="town's own site ranking"
           />
           <StatTile label="Home site not ranking" value={String(homeMissing)} detail="not in the top 100" />
-          <StatTile label="Keywords with overlap" value={String(overlapRows)} detail="other network sites in the SERP" />
+          <StatTile label="Keywords with overlap" value={String(overlapRows)} detail="other campaign sites in the SERP" />
         </div>
       )}
 
       {keywords.length === 0 ? (
         <EmptyState
-          title="No keywords tracked yet"
-          body="Import your domains with their towns below, add keyword patterns, and the full keyword list generates itself."
+          title={`No keywords in “${campaign.name}” yet`}
+          body="Import this campaign's domains with their towns below, add keyword patterns, and the full keyword list generates itself. For a single site, import the one domain and add your handful of keywords by hand."
         />
       ) : (
         <>
@@ -568,10 +764,10 @@ export default async function RankTrackerPage({
             {viewLink("overlap", "Overlap", overlapRows)}
             {viewLink("failed", "Failed checks", summarised.filter((s) => s.check?.error).length)}
             {(() => {
-              const today = new Date().toISOString().slice(0, 10);
-              const failedToday = checks.filter((r) => r.error && r.check_date === today).length;
+              const failedToday = checks.filter((r) => r.error && r.check_date === todayStr).length;
               return failedToday > 0 ? (
                 <form action={retryFailedChecks}>
+                  <input type="hidden" name="campaign" value={campaignId} />
                   <PendingButton
                     pendingLabel="Unlocking…"
                     className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
@@ -583,6 +779,7 @@ export default async function RankTrackerPage({
             })()}
             <span className="ml-auto flex items-center gap-2">
               <form method="GET" className="flex items-center gap-2">
+                <input type="hidden" name="campaign" value={campaignId} />
                 {view !== "all" && <input type="hidden" name="view" value={view} />}
                 {sort !== "az" && <input type="hidden" name="sort" value={sort} />}
                 <input
@@ -705,7 +902,7 @@ export default async function RankTrackerPage({
                   )}
                   {overlap.length > 0 && (
                     <p className="mt-1.5 text-xs text-ink-2">
-                      Overlap: {overlap.length} other network {overlap.length === 1 ? "site ranks" : "sites rank"} in
+                      Overlap: {overlap.length} other campaign {overlap.length === 1 ? "site ranks" : "sites rank"} in
                       this town&rsquo;s SERP.
                     </p>
                   )}
@@ -745,6 +942,7 @@ export default async function RankTrackerPage({
                     ) : (
                       <Link
                         href={`/rank-tracker?${new URLSearchParams({
+                          campaign: campaignId,
                           ...(q ? { q } : {}),
                           ...(view !== "all" ? { view } : {}),
                           ...(sort !== "az" ? { sort } : {}),
@@ -765,6 +963,7 @@ export default async function RankTrackerPage({
                 Showing {limit} of {visible.length} —{" "}
                 <Link
                   href={`/rank-tracker?${new URLSearchParams({
+                    campaign: campaignId,
                     ...(q ? { q } : {}),
                     ...(view !== "all" ? { view } : {}),
                     ...(sort !== "az" ? { sort } : {}),
@@ -781,16 +980,18 @@ export default async function RankTrackerPage({
         </>
       )}
 
-      {/* ── Setup ── */}
+      {/* ── Setup (everything here applies to the selected campaign) ── */}
       <div className="mt-6 grid gap-4 lg:grid-cols-2">
         <Card className="p-4">
           <div className="mb-2 text-sm font-medium text-ink">
             1 · Import domains with their towns
             <span className="ml-2 text-xs font-normal text-muted">
-              {watchDomains.length} imported · {(sites ?? []).length} from GSC
+              {watchDomains.length} in {campaign.name}
+              {gscCount > 0 && ` · ${gscCount} GSC-connected`}
             </span>
           </div>
           <form action={addDomains} className="space-y-2">
+            <input type="hidden" name="campaign" value={campaignId} />
             <textarea
               name="domains"
               required
@@ -853,6 +1054,7 @@ export default async function RankTrackerPage({
         <Card className="p-4">
           <div className="mb-2 text-sm font-medium text-ink">2 · Generate keywords from patterns</div>
           <form action={generateKeywords} className="space-y-2">
+            <input type="hidden" name="campaign" value={campaignId} />
             <textarea
               name="patterns"
               required
@@ -874,9 +1076,10 @@ export default async function RankTrackerPage({
               </PendingButton>
             </div>
             <p className="text-xs text-muted">
-              Every pattern is generated for every imported town and checked FROM that town —
-              “near me” style patterns too. 5 patterns × 292 towns = 1,460 keywords (~$3 per full
-              run). Existing keywords are never duplicated.
+              Every pattern is generated for every town in this campaign and checked FROM that town
+              — “near me” style patterns too. 5 patterns × 292 towns = 1,460 keywords (~$3 per full
+              run); 5 patterns × 1 town = 5 keywords (a penny or two). Existing keywords are never
+              duplicated.
             </p>
           </form>
           <details className="mt-3 text-xs text-ink-2">
@@ -884,6 +1087,7 @@ export default async function RankTrackerPage({
               Add one-off keywords manually / clear all
             </summary>
             <form action={addKeywords} className="mt-2 space-y-2">
+              <input type="hidden" name="campaign" value={campaignId} />
               <textarea
                 name="keywords"
                 rows={3}
@@ -899,13 +1103,43 @@ export default async function RankTrackerPage({
               </div>
             </form>
             <form action={deleteAllKeywords} className="mt-2">
+              <input type="hidden" name="campaign" value={campaignId} />
               <PendingButton pendingLabel="Deleting…" className="text-critical hover:underline">
-                Delete ALL tracked keywords (their ranking history goes with them)
+                Delete every keyword in {campaign.name} (its ranking history goes with them)
               </PendingButton>
             </form>
           </details>
         </Card>
       </div>
+
+      <details className="mt-4 text-xs text-ink-2">
+        <summary className="cursor-pointer select-none text-muted hover:text-ink">
+          Campaign settings — rename or delete “{campaign.name}”
+        </summary>
+        <div className="mt-2 flex flex-wrap items-center gap-6">
+          <form action={renameCampaign} className="flex flex-wrap items-center gap-2">
+            <input type="hidden" name="campaign" value={campaignId} />
+            <input
+              name="name"
+              required
+              maxLength={80}
+              defaultValue={campaign.name}
+              className={`${input} w-64`}
+              aria-label="Campaign name"
+            />
+            <PendingButton pendingLabel="Saving…" className="font-medium text-series-1 hover:underline">
+              Rename
+            </PendingButton>
+          </form>
+          <form action={deleteCampaign}>
+            <input type="hidden" name="campaign" value={campaignId} />
+            <PendingButton pendingLabel="Deleting…" className="text-critical hover:underline">
+              Delete this campaign — {watchDomains.length} domains, {keywords.length} keywords and
+              all of their ranking history
+            </PendingButton>
+          </form>
+        </div>
+      </details>
     </div>
   );
 }

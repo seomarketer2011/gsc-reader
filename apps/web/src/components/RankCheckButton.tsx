@@ -3,10 +3,17 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-// Drives the queue-based rank check: the first call posts every unchecked
-// keyword to DataForSEO's task queue, then the loop collects results as they
-// finish. Closing the tab is safe — the server cron keeps collecting.
-export function RankCheckButton({ keywordCount }: { keywordCount: number }) {
+// Drives the queue-based rank check for ONE campaign: the first call posts
+// that campaign's unchecked keywords to DataForSEO's task queue, then the
+// loop collects results as they finish. Closing the tab is safe — the server
+// cron keeps collecting.
+export function RankCheckButton({
+  keywordCount,
+  campaignId,
+}: {
+  keywordCount: number;
+  campaignId: string;
+}) {
   const router = useRouter();
   const [state, setState] = useState<"idle" | "running" | "done" | "error">("idle");
   const [message, setMessage] = useState("");
@@ -19,7 +26,11 @@ export function RankCheckButton({ keywordCount }: { keywordCount: number }) {
     try {
       for (let i = 0; i < 400; i++) {
         if (cancelled.current) return;
-        const res = await fetch("/api/rank-tracker/run", { method: "POST" });
+        const res = await fetch("/api/rank-tracker/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ campaignId }),
+        });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
         if (data.done) {
