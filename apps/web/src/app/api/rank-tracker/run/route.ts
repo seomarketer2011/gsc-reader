@@ -34,27 +34,25 @@ export async function POST(request: Request) {
   const user = supabase ? (await supabase.auth.getUser()).data.user : null;
   if (!user) return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
 
-  const { data: membership } = await supabase!
-    .from("organisation_users")
-    .select("organisation_id")
-    .eq("user_id", user.id)
-    .limit(1)
-    .maybeSingle();
-  if (!membership) return NextResponse.json({ error: "no organisation" }, { status: 403 });
-  const orgId = membership.organisation_id as string;
-
-  // The campaign is the unit of work; checked against the caller's own
-  // client so a forged id can't reach another organisation's keywords.
+  // The campaign is the unit of work, and it carries its own organisation.
+  // Read through the caller's client so RLS does the authorisation: a
+  // campaign in an organisation they don't belong to simply isn't returned.
+  //
+  // Do NOT cross-check against a separately-looked-up "current" org.
+  // organisation_users is read with limit(1) and no ordering, so a user in
+  // more than one organisation can get a different row here than the page
+  // did — which showed up as "campaign not found" on a campaign plainly
+  // visible on screen.
   const body = (await request.json().catch(() => ({}))) as { campaignId?: string };
   const campaignId = String(body.campaignId ?? "");
   if (!campaignId) return NextResponse.json({ error: "campaign required" }, { status: 400 });
   const { data: campaign } = await supabase!
     .from("campaigns")
-    .select("id")
+    .select("id, organisation_id")
     .eq("id", campaignId)
-    .eq("organisation_id", orgId)
     .maybeSingle();
   if (!campaign) return NextResponse.json({ error: "campaign not found" }, { status: 404 });
+  const orgId = campaign.organisation_id as string;
 
   const service = getServiceClient();
   if (!service) return NextResponse.json({ error: "service key missing" }, { status: 500 });

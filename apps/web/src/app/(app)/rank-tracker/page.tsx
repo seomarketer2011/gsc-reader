@@ -46,22 +46,33 @@ async function caller(): Promise<{ supabase: SupabaseClient; orgId: string } | n
   return membership ? { supabase, orgId: membership.organisation_id as string } : null;
 }
 
-/** Campaign id from a form, verified to belong to the caller's org — every
- * write lands inside one campaign, so a stale or forged id must not slip
- * rows into someone else's list. */
+/**
+ * Campaign id from a form, resolved to the campaign's OWN organisation.
+ *
+ * Deliberately not matched against a separately-looked-up "current" org:
+ * organisation_users is read with limit(1) and no ordering, so a user who
+ * belongs to more than one organisation can get a different answer on two
+ * requests — and every campaign write would then silently do nothing. The
+ * campaign row carries the organisation, and RLS only returns campaigns in
+ * organisations the caller belongs to, so reading it is both simpler and
+ * the stricter check.
+ */
 async function callerCampaign(
   formData: FormData,
 ): Promise<{ supabase: SupabaseClient; orgId: string; campaignId: string } | null> {
-  const c = await caller();
+  const supabase = await getServerClient();
   const campaignId = String(formData.get("campaign") ?? "");
-  if (!c || !campaignId) return null;
-  const { data } = await c.supabase
+  if (!supabase || !campaignId) return null;
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData.user) return null;
+  const { data } = await supabase
     .from("campaigns")
-    .select("id")
+    .select("id, organisation_id")
     .eq("id", campaignId)
-    .eq("organisation_id", c.orgId)
     .maybeSingle();
-  return data ? { ...c, campaignId } : null;
+  return data
+    ? { supabase, orgId: data.organisation_id as string, campaignId }
+    : null;
 }
 
 const titleCase = (s: string) =>

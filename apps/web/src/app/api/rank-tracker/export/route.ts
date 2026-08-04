@@ -29,7 +29,9 @@ export async function GET(request: NextRequest) {
     .limit(1)
     .maybeSingle();
   if (!membership) return NextResponse.json({ error: "no organisation" }, { status: 403 });
-  const orgId = membership.organisation_id as string;
+  // Only used to pick a default campaign; replaced by the campaign's own
+  // organisation once one is chosen.
+  let orgId = membership.organisation_id as string;
 
   async function all<T>(build: (from: number, to: number) => PromiseLike<{ data: T[] | null }>) {
     const out: T[] = [];
@@ -41,26 +43,32 @@ export async function GET(request: NextRequest) {
   }
 
   // Export follows the dashboard's selected campaign; without one, the first
-  // campaign, so a hand-typed URL still returns something sensible.
+  // campaign, so a hand-typed URL still returns something sensible. The
+  // campaign carries its own organisation — see the note in the run route
+  // about why that beats matching against a looked-up "current" org.
   const requested = request.nextUrl.searchParams.get("campaign") ?? "";
-  const { data: campaignRow } = await supabase!
-    .from("campaigns")
-    .select("id, name")
-    .eq("organisation_id", orgId)
-    .order("name")
-    .limit(1)
-    .maybeSingle();
   const { data: chosen } = requested
     ? await supabase!
         .from("campaigns")
-        .select("id, name")
+        .select("id, name, organisation_id")
         .eq("id", requested)
-        .eq("organisation_id", orgId)
         .maybeSingle()
     : { data: null };
-  const campaign = (chosen ?? campaignRow) as { id: string; name: string } | null;
+  const { data: fallback } = chosen
+    ? { data: null }
+    : await supabase!
+        .from("campaigns")
+        .select("id, name, organisation_id")
+        .eq("organisation_id", orgId)
+        .order("name")
+        .limit(1)
+        .maybeSingle();
+  const campaign = (chosen ?? fallback) as
+    | { id: string; name: string; organisation_id: string }
+    | null;
   if (!campaign) return NextResponse.json({ error: "no campaign" }, { status: 404 });
   const campaignId = campaign.id;
+  orgId = campaign.organisation_id;
 
   const cutoffDate = new Date();
   cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
