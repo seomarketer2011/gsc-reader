@@ -300,6 +300,87 @@ async function addKeywords(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/**
+ * Re-resolves every location already in this campaign against DataForSEO's
+ * current list — the answer to "are my existing keywords searching from the
+ * right place?" without re-importing anything. Domains go first because
+ * keyword locations are derived from their checkpoints, so both end up on
+ * the same canonical spelling and home-site matching stays intact.
+ */
+async function revalidateLocations(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const locations = await fetchUkLocations();
+  if (!locations) return; // lookup unavailable — leave everything untouched
+
+  const domains = await fetchAllRows<{ location: string | null; serp_location: string | null }>(
+    (from, to) =>
+      c.supabase
+        .from("tracked_domains")
+        .select("location, serp_location")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+  );
+  // Rows carrying a checkpoint, grouped by it; then rows that have only a
+  // town, which resolve into a checkpoint for the first time.
+  const withCheckpoint = new Set(
+    domains.map((d) => d.serp_location?.trim()).filter((v): v is string => Boolean(v)),
+  );
+  for (const checkpoint of withCheckpoint) {
+    const r = resolveLocation(locations, checkpoint);
+    await c.supabase
+      .from("tracked_domains")
+      .update({ serp_location: r.name, location_valid: r.valid })
+      .eq("campaign_id", c.campaignId)
+      .eq("serp_location", checkpoint);
+  }
+  const townOnly = new Set(
+    domains
+      .filter((d) => !d.serp_location?.trim())
+      .map((d) => d.location?.trim())
+      .filter((v): v is string => Boolean(v)),
+  );
+  for (const town of townOnly) {
+    const r = resolveLocation(locations, town);
+    await c.supabase
+      .from("tracked_domains")
+      .update({ serp_location: r.name, location_valid: r.valid })
+      .eq("campaign_id", c.campaignId)
+      .is("serp_location", null)
+      .eq("location", town);
+  }
+
+  const keywords = await fetchAllRows<{ location_name: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("location_name")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  for (const location of new Set(keywords.map((k) => k.location_name))) {
+    const r = resolveLocation(locations, location);
+    const { error } = await c.supabase
+      .from("tracked_keywords")
+      .update({ location_name: r.name, location_valid: r.valid })
+      .eq("campaign_id", c.campaignId)
+      .eq("location_name", location);
+    // Two spellings can resolve to the same canonical name, which collides
+    // with (campaign_id, keyword, location_name). Record the verdict without
+    // the rename and leave the duplicates for the operator to remove.
+    if (error) {
+      await c.supabase
+        .from("tracked_keywords")
+        .update({ location_valid: r.valid })
+        .eq("campaign_id", c.campaignId)
+        .eq("location_name", location);
+    }
+  }
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteKeyword(formData: FormData) {
   "use server";
   const c = await caller();
@@ -754,11 +835,42 @@ export default async function RankTrackerPage({
       )}
 
       {(() => {
+        const bad = keywords.filter((k) => k.location_valid === false);
+        const unchecked = keywords.filter((k) => k.location_valid === null);
+        if (bad.length === 0 && unchecked.length === 0) return null;
+        const recheck = (
+          <form action={revalidateLocations} className="mt-2">
+            <input type="hidden" name="campaign" value={campaignId} />
+            <PendingButton
+              pendingLabel="Checking locations…"
+              className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+            >
+              Check every location against DataForSEO
+            </PendingButton>
+          </form>
+        );
+        // Nothing has been verified yet — keywords added before locations
+        // were resolved on the way in. Free to check, and it settles whether
+        // the campaign is pointed at the right places.
+        if (bad.length === 0) {
+          return (
+            <Card className="mb-4 p-3 text-sm text-ink">
+              <span className="font-medium">
+                {unchecked.length} {unchecked.length === 1 ? "keyword hasn't" : "keywords haven't"}{" "}
+                had their search location verified.
+              </span>{" "}
+              <span className="text-ink-2">
+                They were added before locations were resolved on import. Checking is free and
+                takes a second — it rewrites each one to the exact name DataForSEO uses and flags
+                any it doesn&rsquo;t recognise.
+              </span>
+              {recheck}
+            </Card>
+          );
+        }
         // Locations Google will never be asked from. Worth stopping for: the
         // checks fail rather than returning the wrong town, but a run spent
         // on them is a run wasted.
-        const bad = keywords.filter((k) => k.location_valid === false);
-        if (bad.length === 0) return null;
         const names = [...new Set(bad.map((k) => k.location_name))];
         return (
           <Card className="mb-4 border-critical/40 p-3 text-sm text-ink">
@@ -772,7 +884,10 @@ export default async function RankTrackerPage({
               Re-import the domain with a postcode district as its third column (e.g.
               &ldquo;domain, Bickley, BR1&rdquo;) and generate again, or re-add the keywords with a
               location spelled the way DataForSEO lists it.
+              {unchecked.length > 0 &&
+                ` ${unchecked.length} more haven't been checked at all yet.`}
             </span>
+            {recheck}
           </Card>
         );
       })()}
