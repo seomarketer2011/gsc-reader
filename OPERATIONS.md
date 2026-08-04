@@ -4,7 +4,7 @@
 truth for what this app is, where everything lives, how to run and deploy it,
 and how to operate it day to day. It assumes no prior context.
 
-Last updated: 2026-07-20.
+Last updated: 2026-08-04.
 
 ---
 
@@ -23,8 +23,10 @@ in `docs/IMPLEMENTATION_PLAN.md`.
 **Current status:** Live and in real use. Phases 1–6 of the plan are built:
 app shell, Supabase auth, Google OAuth + import, per-site detectors, DataForSEO
 volumes, query clustering, standalone keyword research (with idea discovery),
-the cross-site network engine, and a nightly auto-refresh cron. Raw performance
-data currently lives in Postgres, not BigQuery (see §9 Known limitations).
+the cross-site network engine, and a campaign-scoped rank tracker. Nothing
+refreshes automatically — every import, analysis and rank check is started by
+hand from the app (see §7). Raw performance data currently lives in Postgres,
+not BigQuery (see §9 Known limitations).
 
 ---
 
@@ -66,7 +68,7 @@ The connected Google account for GSC data is `pauldanielstone@gmail.com`.
 | `TOKEN_ENCRYPTION_KEY` | Generated once: `openssl rand -base64 32` (32 bytes) | AES-256-GCM encryption of stored Google refresh tokens | **NO — secret** |
 | `DATAFORSEO_LOGIN` | DataForSEO account email | Search-volume API auth | NO — secret |
 | `DATAFORSEO_PASSWORD` | DataForSEO dashboard → **API Access** (a generated API password, NOT the website password) | Search-volume API auth | NO — secret |
-| `CRON_SECRET` | Generated once: `openssl rand -hex 24` | Guards the `/api/cron/daily` endpoint | **NO — secret** |
+| `CRON_SECRET` | Generated once: `openssl rand -hex 24` | Guards both `/api/cron/*` endpoints | **NO — secret** |
 
 If `TOKEN_ENCRYPTION_KEY` is ever lost or changed, existing stored Google
 refresh tokens become undecryptable — every Google connection must be
@@ -102,6 +104,14 @@ Applied migrations, in order:
 | `20260712000003_performance_data.sql` | `gsc_performance_daily` (raw GSC rows) + `gsc_site_daily` view |
 | `20260712000004_keyword_volumes.sql` | `keyword_volumes` cache + `low_visibility` opportunity type |
 | `20260712000005_keyword_research.sql` | `keyword_volumes.monthly` + `competition_index` columns |
+| `20260802000006_unique_group_names.sql` | Unique campaign (site group) name per organisation |
+| `20260802000007_rank_tracker.sql` | `tracked_keywords`, `tracked_domains`, `serp_checks`, `serp_rankings` |
+| `20260802000008_domain_home_locations.sql` | `tracked_domains.location` (home town) |
+| `20260802000009_location_validation.sql` | `tracked_domains.location_valid` |
+| `20260802000010_serp_location_override.sql` | `tracked_domains.serp_location` (where the SERP is fetched from) |
+| `20260802000011_serp_task_queue.sql` | `serp_task_queue` (DataForSEO standard-queue tasks in flight) |
+| `20260802000012_rank_tracker_campaigns.sql` | `campaign_id` required on both tracked tables; existing data backfilled into one campaign per org; uniqueness moved under the campaign |
+| `20260802000013_keyword_location_validation.sql` | `tracked_keywords.location_valid` |
 
 **When adding a migration:** write a new timestamped `.sql` file, validate it
 (there is a PGlite validator harness used during development — apply all
@@ -156,22 +166,72 @@ There is no CI/CD yet — deploys are run by hand from a machine (or session) th
 has `wrangler` authenticated to the Cloudflare account. Cloudflare can also be
 connected to the GitHub repo for auto-deploy on push if desired (not set up).
 
+### Deploying from a Claude Code session
+
+Sessions on this repo are provisioned with Cloudflare credentials already in
+the environment, so a deploy can be run directly from a session — there is no
+need to ask the operator to do it on their own machine:
+
+- `CLOUDFLARE_API_KEY` + `CLOUDFLARE_EMAIL` — global API key auth, which
+  `wrangler` picks up with no login step. Confirm with `npx wrangler whoami`.
+- **`CLOUDFLARE_ACCOUNT_ID` in the environment does NOT necessarily point at
+  this project's account.** The global key can see many accounts. This app
+  lives on `44799b719f2192a9f066f425aaff3106`
+  (Seomarketer2011@yahoo.co.uk), which is also the `account_id` pinned in
+  `wrangler.jsonc`. Pin it on the command as well so the two can never
+  disagree:
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=44799b719f2192a9f066f425aaff3106 npx wrangler deploy
+```
+
+The build still needs the two `NEXT_PUBLIC_*` values exported (above). The
+Supabase publishable key is not in the repo and not in the session
+environment; it is baked into the deployed client bundle, so it can be
+recovered from the live site when it isn't to hand — fetch `/login`, find the
+`/_next/static/chunks/*.js` chunk containing `hlqmeuxaigjjenrupmuv`, and pull
+the `sb_publishable_…` value out of it. It is a publishable key: public by
+design, safe to use this way, still not something to commit.
+
+After deploying, check the trigger list wrangler prints back (§7) — it is the
+quickest confirmation that the cron configuration deployed as intended.
+
 ---
 
-## 7. The nightly job (cron)
+## 7. Scheduled jobs (cron)
 
-- **Schedule:** `30 3 * * *` (03:30 UTC daily), declared in `wrangler.jsonc`.
-- **What it does:** `worker-entry.mjs` `scheduled()` → POSTs to
-  `/api/cron/daily` with the `x-cron-secret` header. That route
-  (`apps/web/src/app/api/cron/daily/route.ts`), for every tracked property:
-  re-imports the last 5 days of GSC data (idempotent upserts; GSC finalises data
-  ~2–3 days late), re-runs the per-site detectors, then runs the network
-  detector per organisation. Every run is logged to the `sync_runs` table.
-- **Protection:** rejects any call without the correct `CRON_SECRET`.
-- **Manual trigger (for testing):**
-  `curl -X POST https://gsc-reader.seomarketer2011.workers.dev/api/cron/daily -H "x-cron-secret: <CRON_SECRET>"`
-- Frequency can be reduced to weekly by editing the cron and widening the
-  re-import window from 5 to ~10 days. Cost is not a reason to (see §10).
+**Nothing refreshes on a schedule.** By operator decision, GSC imports,
+analysis and rank checks all happen only when their button in the app is
+pressed. `wrangler.jsonc` declares exactly one trigger:
+
+- **`*/5 * * * *` → `/api/cron/ranks`.** Collects finished DataForSEO tasks
+  and nothing else — it never posts a task, so it cannot spend money on its
+  own. It exists so a rank check started in the app can be left to finish
+  after the tab is closed. Exits immediately when nothing is in flight.
+
+`worker-entry.mjs` `scheduled()` POSTs to that route with the
+`x-cron-secret` header; both cron routes reject any call without the correct
+`CRON_SECRET`.
+
+`/api/cron/daily` still exists and still works — it re-imports the last 5
+days of GSC data for every tracked property (idempotent upserts; GSC
+finalises data ~2–3 days late), re-runs the per-site detectors, then the
+network detector per organisation, logging each run to `sync_runs`. It is
+simply no longer scheduled. To run it:
+
+```bash
+curl -X POST https://gsc-reader.seomarketer2011.workers.dev/api/cron/daily \
+  -H "x-cron-secret: <CRON_SECRET>"
+```
+
+To put nightly refresh back, add `"30 3 * * *"` to the `crons` array in
+`wrangler.jsonc`, restore the cron-to-path branch in `worker-entry.mjs`, and
+redeploy. Cost is not a reason to leave it off (see §10) — this is a
+"nothing moves unless I move it" preference.
+
+Note for §9: the nightly job's database writes used to be what kept the free
+Supabase project from pausing. With no scheduled writes, an idle week can
+pause the project.
 
 ---
 
@@ -217,8 +277,9 @@ not six. Logic in `apps/web/src/lib/engine/cluster.ts`, unit-tested.
   at scale (Phase 6 in the plan). Fine for a handful of sites; the Supabase free
   tier's 500 MB cap is the real ceiling (~10–20 data-rich sites). See §10.
 - **Supabase is on the free tier.** Free projects **pause after ~1 week of
-  inactivity** — the nightly cron's DB writes keep it awake, but if the app goes
-  quiet and the project pauses, the app goes down until it's resumed. Upgrading
+  inactivity** — and since the nightly cron was switched off (§7) nothing
+  writes to the database on a schedule any more, so a quiet week now really
+  can pause it. The app goes down until it's resumed from the dashboard. Upgrading
   to Pro ($25/mo) removes this and raises the size cap. **This is the first
   upgrade to make as usage grows.**
 - **Date-range selector** affects Sites and site detail, but Query clusters and
@@ -288,7 +349,8 @@ apps/web/
   src/app/api/google/       OAuth start/callback + chunked import
   src/app/api/analysis/run/ on-demand "Run analysis"
   src/app/api/keywords/     lookup + suggest (DataForSEO)
-  src/app/api/cron/daily/   nightly job endpoint (secret-guarded)
+  src/app/api/cron/daily/   GSC top-up + detectors (secret-guarded; no longer scheduled)
+  src/app/api/cron/ranks/   rank-tracker collection tick (secret-guarded; */5)
   src/lib/supabase/         browser/server/service clients (+ fixture fallback)
   src/lib/google/           OAuth, token crypto, GSC import
   src/lib/engine/           detect (per-site) · network (cross-site) ·
