@@ -108,7 +108,47 @@ export async function POST(request: Request) {
     ...queuedToday.map((q) => q.keyword_id),
   ]);
   const toPost = keywords.filter((k) => !excluded.has(k.id));
-  const posted = toPost.length > 0 ? await postSerpTasks(service, orgId, toPost, depth, priority) : 0;
+  // Claim before posting. Two tabs — or one impatient double press — can hit
+  // this route in the same second; both would see an empty queue and both
+  // would pay to post the same keywords. The queue's (keyword_id,
+  // check_date) uniqueness makes claiming atomic: ignoreDuplicates hands
+  // each keyword to exactly one caller, and only the winner posts it.
+  let posted = 0;
+  if (toPost.length > 0) {
+    const { data: claimedRows } = await service
+      .from("serp_task_queue")
+      .upsert(
+        toPost.map((k) => ({
+          organisation_id: orgId,
+          keyword_id: k.id,
+          task_id: `claim-${k.id}`,
+          depth,
+        })),
+        { onConflict: "keyword_id,check_date", ignoreDuplicates: true },
+      )
+      .select("keyword_id");
+    const won = new Set((claimedRows ?? []).map((r) => r.keyword_id as string));
+    const mineToPost = toPost.filter((k) => won.has(k.id));
+    if (mineToPost.length > 0) {
+      try {
+        posted = await postSerpTasks(service, orgId, mineToPost, depth, priority);
+      } finally {
+        // Release claims that never became real tasks (post failed or was
+        // rejected), so those keywords aren't blocked until expiry. Scoped
+        // to OUR claim ids — another caller's fresh claims must survive.
+        for (let i = 0; i < mineToPost.length; i += 100) {
+          await service
+            .from("serp_task_queue")
+            .delete()
+            .eq("organisation_id", orgId)
+            .in(
+              "task_id",
+              mineToPost.slice(i, i + 100).map((k) => `claim-${k.id}`),
+            );
+        }
+      }
+    }
+  }
 
   const mine = new Set(keywords.map((k) => k.id));
   const watched = await getWatchedDomains(service, orgId);

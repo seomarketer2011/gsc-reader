@@ -424,7 +424,23 @@ export async function collectSerpResults(
     if (!data || data.length < QUEUE_PAGE) break;
   }
   if (queue.length === 0 && !keywordIds?.size) return { collected: 0, failed: 0, remaining: 0 };
-  const byTaskId = new Map(queue.map((q) => [q.task_id, q]));
+  // "claim-" rows are reservations made just before task_post (they are what
+  // stops two concurrent posters paying for the same keyword). The poster
+  // replaces them with real task ids or deletes them; one that survives 30
+  // minutes belonged to a poster that crashed mid-post, and there is nothing
+  // at DataForSEO to fetch for it — release it so the keyword isn't stuck.
+  const nowMs = Date.now();
+  const deadClaims = queue.filter(
+    (q) => q.task_id.startsWith("claim-") && nowMs - new Date(q.posted_at).getTime() > 30 * 60000,
+  );
+  for (let i = 0; i < deadClaims.length; i += 100) {
+    await service
+      .from("serp_task_queue")
+      .delete()
+      .in("id", deadClaims.slice(i, i + 100).map((q) => q.id));
+  }
+  const live = queue.filter((q) => !q.task_id.startsWith("claim-"));
+  const byTaskId = new Map(live.map((q) => [q.task_id, q]));
 
   // Which of our tasks are ready? Includes orphans recognised by tag.
   const readyRes = await fetch("https://api.dataforseo.com/v3/serp/google/organic/tasks_ready", {
@@ -456,7 +472,7 @@ export async function collectSerpResults(
   // Stale rows: poll directly in case their "ready" entry was already consumed.
   const now = Date.now();
   const readySet = new Set(readyIds);
-  const stale = queue.filter(
+  const stale = live.filter(
     (q) => !readySet.has(q.task_id) && now - new Date(q.posted_at).getTime() > 20 * 60000,
   );
   const toFetch = [...readyIds, ...stale.map((s) => s.task_id)].slice(0, maxTasks);
