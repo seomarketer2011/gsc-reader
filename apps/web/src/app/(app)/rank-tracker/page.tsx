@@ -1141,11 +1141,14 @@ export default async function RankTrackerPage({
       {inFlight > 0 &&
         (() => {
           // DataForSEO's standard queue normally returns everything inside 20
-          // minutes. Past an hour a task is not slow, it is stuck — and
-          // because a queued keyword is skipped by the next check (that is
-          // what stops it being paid for twice), a stuck row blocks its
-          // keyword until collection expires it. Hence the escape hatch.
-          const stuck = inFlightMinutes >= 60;
+          // minutes, so half an hour with NOTHING collected is a dead run,
+          // not a slow one — and because a queued keyword is skipped by the
+          // next check (that is what stops it being paid for twice), stuck
+          // rows silently turn "Check rankings now" into a no-op that still
+          // looks like a fresh run. Hence the escape hatch, and hence it
+          // must appear before anyone has waited an hour to use it. A run
+          // that is genuinely landing results keeps the higher bar.
+          const stuck = inFlightMinutes >= (collectedToday === 0 ? 30 : 60);
           return (
             <Card
               className={`mb-4 p-3 text-sm text-ink ${stuck ? "border-warning/60" : "border-series-1/40"}`}
