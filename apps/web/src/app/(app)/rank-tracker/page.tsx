@@ -618,15 +618,23 @@ export default async function RankTrackerPage({
   const primaryBtn =
     "rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90";
 
+  // Campaigns are listed through RLS with no organisation filter, and every
+  // org-scoped query below uses the SELECTED CAMPAIGN's organisation. Do not
+  // reintroduce a filter on caller()'s organisation: organisation_users is
+  // read with limit(1) and no ordering, so a user in more than one
+  // organisation gets a different answer on different requests — which
+  // showed up as this page randomly forgetting every campaign and offering
+  // "create your first campaign" instead. (Same trap as the run route; see
+  // the note on callerCampaign.)
   const { data: campaignRows } = await c.supabase
     .from("campaigns")
-    .select("id, name, serp_depth")
-    .eq("organisation_id", c.orgId)
+    .select("id, name, serp_depth, organisation_id")
     .order("name");
   const campaigns = (campaignRows ?? []) as {
     id: string;
     name: string;
     serp_depth: number | null;
+    organisation_id: string;
   }[];
   const requested = typeof params.campaign === "string" ? params.campaign : "";
   const campaign = campaigns.find((x) => x.id === requested) ?? campaigns[0] ?? null;
@@ -666,6 +674,9 @@ export default async function RankTrackerPage({
     );
   }
   const campaignId = campaign.id;
+  // The campaign's own organisation scopes everything below — not caller()'s,
+  // which is unstable for multi-organisation users (see above).
+  const orgId = campaign.organisation_id;
   // What the NEXT check will look at. Results already stored keep whatever
   // depth they were taken at.
   const depth = normaliseDepth(campaign.serp_depth);
@@ -699,7 +710,7 @@ export default async function RankTrackerPage({
         .order("domain")
         .range(from, to),
     ),
-    c.supabase.from("sites").select("id, domain").eq("organisation_id", c.orgId),
+    c.supabase.from("sites").select("id, domain").eq("organisation_id", orgId),
   ]);
   const keywordIds = new Set(keywords.map((k) => k.id));
 
@@ -783,7 +794,7 @@ export default async function RankTrackerPage({
             c.supabase
               .from("serp_checks")
               .select(CHECK_COLUMNS)
-              .eq("organisation_id", c.orgId)
+              .eq("organisation_id", orgId)
               .gte("check_date", cutoff)
               .order("check_date", { ascending: false })
               .range(from, to),
@@ -798,7 +809,7 @@ export default async function RankTrackerPage({
         c.supabase
           .from("serp_task_queue")
           .select("keyword_id, posted_at")
-          .eq("organisation_id", c.orgId)
+          .eq("organisation_id", orgId)
           .order("keyword_id")
           .range(from, to),
       )
@@ -851,7 +862,7 @@ export default async function RankTrackerPage({
           return (
             keywords.length <= SCOPED_MAX
               ? query.in("keyword_id", [...keywordIds])
-              : query.eq("organisation_id", c.orgId)
+              : query.eq("organisation_id", orgId)
           )
             .in("check_date", comparedDates)
             .order("id")
