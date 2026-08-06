@@ -1,8 +1,9 @@
-// Organic rank checking via DataForSEO Google SERPs (server only; costs
-// real money — roughly $2 per 1,000 keyword checks). One SERP fetch per
-// keyword+location covers EVERY watched domain at once: the top-100 result
-// list is matched against all of them, so cost scales with keywords, not
-// with the number of sites.
+// Organic rank checking via DataForSEO Google SERPs (server only; costs real
+// money — about $0.006 per keyword on the standard queue, because depth 100
+// is ten result pages billed as ten, so roughly $6 per 1,000 keyword checks).
+// One SERP fetch per keyword+location covers EVERY watched domain at once:
+// the top-100 result list is matched against all of them, so cost scales with
+// keywords, not with the number of sites.
 
 import { SupabaseClient } from "@supabase/supabase-js";
 import { dataForSeoConfigured } from "./volumes";

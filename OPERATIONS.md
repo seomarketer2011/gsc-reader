@@ -252,6 +252,43 @@ pause the project.
    **Coverage matrix** (cross-site topic coverage), **Sites**, **Query
    clusters**, **Keyword research**, and **Rollouts**.
 
+### Rank tracker: what a check costs and how long it takes
+
+- **Cost.** One keyword = one Google top-100 SERP = **about $0.006** on
+  DataForSEO's standard queue (depth 100 is ten result pages, billed as ten).
+  A 477-keyword campaign is ~$2.90 a run; the button shows the estimate before
+  you press it. Check the balance at
+  `https://api.dataforseo.com/v3/appendix/user_data` — a run that would
+  overdraw it fails at posting time.
+- **Timing.** Tasks are posted in seconds and normally come back within a
+  couple of minutes, worst case ~20. The page shows how many are still in
+  flight and how long the oldest has been out there; past **60 minutes** it
+  says "stalled" and offers a button to forget the in-flight tasks so a fresh
+  check can be started.
+- **You can close the tab.** The 5-minute cron (§7) collects whatever is
+  finished. The button watches for 45 minutes and then says so — that message
+  is not a failure.
+- **Nothing is charged twice.** A keyword already checked today, or already
+  queued today, is skipped by the next check. Both exclusions are scoped to
+  today, so yesterday's leftovers can never block today's run.
+
+### Rank tracker: position history
+
+Every check writes one `serp_checks` row (whether it ran) and one
+`serp_rankings` row per watched domain in the top 100. History and movement
+are derived from those rows — there is no separate history table, and no
+migration was needed to add the feature. The rules live in
+`apps/web/src/lib/engine/rank-history.ts` and are unit-tested:
+
+- **Failed checks are not history.** A DataForSEO error says nothing about
+  where a site ranked, so comparisons skip it and use the last check that
+  actually produced positions.
+- **A missing `serp_rankings` row means "not in the top 100"**, which is why
+  "dropped out" has to be computed by comparing two checks rather than read
+  off a column.
+- The dashboard compares the two most recent successful checks; expanding a
+  keyword pulls its last 20 checks (180-day window) as a full position grid.
+
 **Network rollout cards only appear with 2+ sites in the same trade** — a topic
 that wins on one site and is weak/missing on another. Two sites in different
 trades (e.g. an electrician + a locksmith) correctly produce zero rollouts.
@@ -304,7 +341,7 @@ not six. Logic in `apps/web/src/lib/engine/cluster.ts`, unit-tested.
 | Google Search Console API | £0 | Free; nightly usage is far under quota even at 99 sites. |
 | Cloudflare Workers | $5/mo (paid plan active) | One cron/night is negligible. Paid plan raised CPU 10ms→30s and subrequests 50→1000, so in-app analysis/imports are safe. |
 | Supabase | Free now | **Upgrade to Pro ($25/mo) first** as sites grow (size cap + no pausing). |
-| DataForSEO | Pay-as-you-go | Volumes cached 30 days per keyword, so re-analysis is almost all cache hits; new keywords cost fractions of a penny. Top up balance when low. |
+| DataForSEO | Pay-as-you-go | Volumes cached 30 days per keyword, so re-analysis is almost all cache hits; new keywords cost fractions of a penny. **Rank checks are the real spend: ~$0.006 per keyword per run** (see §8), so a 477-keyword campaign is ~$2.90 each time you press the button. Top up balance when low. |
 
 The design (free GSC API, 30-day volume cache, idempotent imports) makes run
 frequency cheap on purpose.

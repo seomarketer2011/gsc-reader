@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerClient } from "@/lib/supabase/server";
 import { normaliseDomain, TopResult } from "@/lib/engine/serp";
+import { movement, positionsOn, RankingRow, successfulCheckDates } from "@/lib/engine/rank-history";
 
 // CSV of the latest check per keyword in ONE campaign (?campaign=): one row
 // per ranked watched domain, plus a row for any home-town domain that is NOT
 // ranking (that absence is the point of the tracker — "not ranking" means
-// absent from the organic top 100). Honours the dashboard's current text
-// filter (?q=), view (?view=missing|overlap|failed) and order (?sort=), so
-// exports are custom slices. Uses the caller's session, so RLS scopes it.
+// absent from the organic top 100). Every row also carries where the domain
+// sat at the previous check and how far it has moved, so the file answers
+// "what changed?" without a second export to diff against. Honours the
+// dashboard's current text filter (?q=), view
+// (?view=missing|overlap|failed|up|down|lost) and order (?sort=), so exports
+// are custom slices. Uses the caller's session, so RLS scopes it.
 const PAGE = 1000;
 
 function esc(v: string | number | null | undefined): string {
@@ -93,19 +97,29 @@ export async function GET(request: NextRequest) {
   ]);
 
   const keywordIds = new Set(keywords.map((k) => k.id));
+  const mineChecks = checks.filter((row) => keywordIds.has(row.keyword_id));
   const latest = new Map<string, { date: string; error: string | null }>();
-  for (const row of checks) {
-    if (!keywordIds.has(row.keyword_id)) continue; // another campaign's check
+  for (const row of mineChecks) {
     if (!latest.has(row.keyword_id)) latest.set(row.keyword_id, { date: row.check_date, error: row.error });
   }
-  const latestDates = [...new Set([...latest.values()].map((v) => v.date))];
-  const rankings = latestDates.length
-    ? await all<{ keyword_id: string; domain: string; position: number; url: string | null; check_date: string }>((f, t) =>
+  // The two most recent checks that produced positions: one to report, one to
+  // measure against. Failed checks are skipped — they say nothing about where
+  // a site ranked, so comparing with one would invent a drop.
+  const history = successfulCheckDates(mineChecks);
+  const currentDate = (id: string) => history.get(id)?.[0];
+  const previousDate = (id: string) => history.get(id)?.[1];
+  const comparedDates = [
+    ...new Set(
+      keywords.flatMap((k) => [currentDate(k.id), previousDate(k.id)]).filter(Boolean) as string[],
+    ),
+  ];
+  const rankings = comparedDates.length
+    ? await all<RankingRow>((f, t) =>
         supabase!
           .from("serp_rankings")
           .select("keyword_id, domain, position, url, check_date")
           .eq("organisation_id", orgId)
-          .in("check_date", latestDates)
+          .in("check_date", comparedDates)
           .order("id")
           .range(f, t),
       )
@@ -113,13 +127,12 @@ export async function GET(request: NextRequest) {
   // Rankings are recorded for every domain the organisation watches, so rows
   // for other campaigns' domains are filtered out here.
   const campaignDomains = new Set(domains.map((d) => normaliseDomain(d.domain)));
-  const rankedBy = new Map<string, { domain: string; position: number; url: string }[]>();
+  const rowsByKeyword = new Map<string, RankingRow[]>();
   for (const r of rankings) {
-    if (!campaignDomains.has(r.domain)) continue;
-    if (r.check_date !== latest.get(r.keyword_id)?.date) continue;
-    const list = rankedBy.get(r.keyword_id) ?? [];
-    list.push({ domain: r.domain, position: r.position, url: r.url ?? "" });
-    rankedBy.set(r.keyword_id, list);
+    if (!keywordIds.has(r.keyword_id) || !campaignDomains.has(r.domain)) continue;
+    const list = rowsByKeyword.get(r.keyword_id);
+    if (list) list.push(r);
+    else rowsByKeyword.set(r.keyword_id, [r]);
   }
 
   // homeKey matches domains to keywords checked from their checkpoint
@@ -150,7 +163,17 @@ export async function GET(request: NextRequest) {
   const summarised = keywords.map((k) => {
     const check = latest.get(k.id) ?? null;
     const town = k.location_name.split(",")[0].trim().toLowerCase();
-    const ranked = (rankedBy.get(k.id) ?? []).sort((a, b) => a.position - b.position);
+    const own = rowsByKeyword.get(k.id) ?? [];
+    const mine = (domain: string) => campaignDomains.has(domain);
+    const prevDate = previousDate(k.id);
+    const movements = movement(
+      positionsOn(own, currentDate(k.id), mine),
+      prevDate
+        ? new Map([...positionsOn(own, prevDate, mine)].map(([d, v]) => [d, v.position]))
+        : null,
+    );
+    const ranked = movements.filter((m) => m.position !== null);
+    const lost = movements.filter((m) => m.state === "lost");
     const candidates = [...homeKey.entries()].filter(([, key]) => key === town).map(([d]) => d);
     const textMatches = candidates.filter((d) => {
       const t = homeTownLower.get(d);
@@ -158,15 +181,33 @@ export async function GET(request: NextRequest) {
     });
     const homeSet = new Set(textMatches.length > 0 ? textMatches : candidates);
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
+    const homeLost = lost.find((r) => homeSet.has(r.domain)) ?? null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && homeKey.has(r.domain));
-    return { k, check, town, ranked, hasHome: homeSet.size > 0, homeSet, home, overlap };
+    return {
+      k,
+      check,
+      town,
+      movements,
+      ranked,
+      lost,
+      hasHome: homeSet.size > 0,
+      homeSet,
+      home,
+      homeLost,
+      overlap,
+      comparedWith: prevDate ?? null,
+    };
   });
 
+  const homeChange = (s: (typeof summarised)[number]) => s.home?.change ?? 0;
   const filtered = summarised.filter((s) => {
     if (q && !s.k.keyword.includes(q) && !s.k.location_name.toLowerCase().includes(q)) return false;
     if (view === "missing") return s.hasHome && s.check && !s.check.error && !s.home;
     if (view === "overlap") return s.overlap.length > 0;
     if (view === "failed") return Boolean(s.check?.error);
+    if (view === "up") return Boolean(s.comparedWith) && homeChange(s) > 0;
+    if (view === "down") return Boolean(s.comparedWith) && homeChange(s) < 0;
+    if (view === "lost") return Boolean(s.comparedWith) && s.lost.length > 0;
     return true;
   });
   if (sort === "best") {
@@ -175,35 +216,61 @@ export async function GET(request: NextRequest) {
     filtered.sort((a, b) => (a.home?.position ?? 999) - (b.home?.position ?? 999));
   } else if (sort === "sites") {
     filtered.sort((a, b) => b.ranked.length - a.ranked.length);
+  } else if (sort === "moved" || sort === "dropped") {
+    const score = (s: (typeof summarised)[number]) =>
+      !s.comparedWith ? 0 : s.homeLost ? -1000 : homeChange(s);
+    filtered.sort((a, b) =>
+      sort === "moved" ? Math.abs(score(b)) - Math.abs(score(a)) : score(a) - score(b),
+    );
   }
 
-  const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];
-  for (const { k, check, ranked, homeSet } of filtered) {
+  // previous_position/change are blank when there is nothing to compare with
+  // — a first check, or a domain that wasn't there last time. That is not the
+  // same as a zero, so it is left empty rather than filled in.
+  const lines = [
+    "keyword,location,checked,previous_check,status,domain,domain_home_town,is_home,position,previous_position,change,url",
+  ];
+  for (const { k, check, ranked, lost, homeSet, comparedWith } of filtered) {
+    const head = [esc(k.keyword), esc(k.location_name)];
     if (!check) {
-      lines.push([esc(k.keyword), esc(k.location_name), "", "unchecked", "", "", "", "", ""].join(","));
+      lines.push([...head, "", "", "unchecked", "", "", "", "", "", "", ""].join(","));
       continue;
     }
     if (check.error) {
-      lines.push([esc(k.keyword), esc(k.location_name), check.date, "failed", "", "", "", "", esc(check.error)].join(","));
+      lines.push([...head, check.date, "", "failed", "", "", "", "", "", "", esc(check.error)].join(","));
       continue;
     }
+    const stamp = [check.date, comparedWith ?? ""];
     const rankedSet = new Set(ranked.map((r) => r.domain));
     for (const r of ranked) {
       lines.push(
         [
-          esc(k.keyword), esc(k.location_name), check.date, "ranked",
+          ...head, ...stamp, "ranked",
           esc(r.domain), esc(homeLabel.get(r.domain) ?? ""), homeSet.has(r.domain) ? "yes" : "no",
-          r.position, esc(r.url),
+          r.position, r.previous ?? "", r.change ?? "", esc(r.url),
         ].join(","),
       );
     }
-    // The keyword's own home site(s) missing from the organic top 100.
+    // Domains that ranked at the previous check and have since fallen out of
+    // the top 100 — the movement that matters most, and the one a
+    // latest-check-only export cannot show at all.
+    for (const r of lost) {
+      lines.push(
+        [
+          ...head, ...stamp, "dropped_out",
+          esc(r.domain), esc(homeLabel.get(r.domain) ?? ""), homeSet.has(r.domain) ? "yes" : "no",
+          "", r.previous ?? "", "", "",
+        ].join(","),
+      );
+    }
+    // The keyword's own home site(s) missing from the organic top 100, and
+    // not already reported above as a fresh drop-out.
+    const droppedSet = new Set(lost.map((r) => r.domain));
     for (const domain of homeSet) {
-      if (!rankedSet.has(domain)) {
-        lines.push(
-          [esc(k.keyword), esc(k.location_name), check.date, "not_ranking", esc(domain), esc(homeLabel.get(domain) ?? ""), "yes", "", ""].join(","),
-        );
-      }
+      if (rankedSet.has(domain) || droppedSet.has(domain)) continue;
+      lines.push(
+        [...head, ...stamp, "not_ranking", esc(domain), esc(homeLabel.get(domain) ?? ""), "yes", "", "", "", ""].join(","),
+      );
     }
   }
 

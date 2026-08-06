@@ -79,11 +79,17 @@ export async function POST(request: Request) {
         .order("keyword_id")
         .range(from, to),
     ),
+    // Today's in-flight tasks only. A queue row is what stops a keyword being
+    // posted (and paid for) twice, but a row left over from an earlier day is
+    // a task that never came back — counting it would exclude its keyword
+    // from every future check and leave `done` permanently out of reach.
+    // Collection still expires those rows separately.
     fetchAllRows<{ keyword_id: string }>((from, to) =>
       service
         .from("serp_task_queue")
         .select("keyword_id")
         .eq("organisation_id", orgId)
+        .eq("check_date", today)
         .order("keyword_id")
         .range(from, to),
     ),
@@ -120,6 +126,7 @@ export async function POST(request: Request) {
         .from("serp_task_queue")
         .select("keyword_id")
         .eq("organisation_id", orgId)
+        .eq("check_date", today)
         .order("keyword_id")
         .range(from, to),
     ),

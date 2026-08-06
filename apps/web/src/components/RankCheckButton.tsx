@@ -1,30 +1,49 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 // Drives the queue-based rank check for ONE campaign: the first call posts
 // that campaign's unchecked keywords to DataForSEO's task queue, then the
 // loop collects results as they finish. Closing the tab is safe — the server
 // cron keeps collecting.
+//
+// Timings are set by how DataForSEO's standard queue actually behaves: most
+// tasks come back within a couple of minutes and effectively all of them
+// inside 20. Watching stops after WATCH_MINUTES, which is NOT a failure —
+// collection carries on server-side either way, so the end of the watch says
+// "still going, look at the page" rather than throwing an error at somebody
+// whose check is running perfectly well.
+const WATCH_MINUTES = 45;
+const FAST_POLL_MS = 5000;
+const SLOW_POLL_MS = 15000;
+const FAST_POLL_FOR_MS = 60000; // tight polling only while results first land
+
 export function RankCheckButton({
   keywordCount,
   campaignId,
+  estimatedCost = "",
 }: {
   keywordCount: number;
   campaignId: string;
+  /** Pre-formatted price of a full run, e.g. "$2.86". Shown before starting. */
+  estimatedCost?: string;
 }) {
   const router = useRouter();
-  const [state, setState] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [state, setState] = useState<"idle" | "running" | "done" | "background" | "error">("idle");
   const [message, setMessage] = useState("");
   const cancelled = useRef(false);
+
+  useEffect(() => () => void (cancelled.current = true), []);
 
   async function run() {
     setState("running");
     setMessage("Queuing keywords…");
     cancelled.current = false;
+    const startedAt = Date.now();
     try {
-      for (let i = 0; i < 400; i++) {
+      let announcedQueue = false;
+      while (Date.now() - startedAt < WATCH_MINUTES * 60000) {
         if (cancelled.current) return;
         const res = await fetch("/api/rank-tracker/run", {
           method: "POST",
@@ -39,17 +58,32 @@ export function RankCheckButton({
           router.refresh();
           return;
         }
-        setMessage(
-          `${data.checked} of ${data.total} collected · ${data.processing} processing…`,
-        );
+        const elapsed = Math.floor((Date.now() - startedAt) / 60000);
+        if (!announcedQueue && data.posted > 0) {
+          announcedQueue = true;
+          setMessage(
+            `${data.posted} keywords queued at DataForSEO — results usually land within 20 minutes.`,
+          );
+        } else {
+          setMessage(
+            `${data.checked} of ${data.total} collected · ${data.processing} still processing${
+              elapsed > 0 ? ` · ${elapsed} min` : ""
+            }…`,
+          );
+        }
         // Stream results onto the dashboard as they land.
-        if (i % 3 === 2) router.refresh();
-        // Results arrive over a few minutes — poll gently, not in a tight loop.
-        await new Promise((r) => setTimeout(r, 5000));
+        router.refresh();
+        await new Promise((r) =>
+          setTimeout(r, Date.now() - startedAt < FAST_POLL_FOR_MS ? FAST_POLL_MS : SLOW_POLL_MS),
+        );
       }
-      throw new Error(
-        "Still processing — safe to close this tab; results keep collecting automatically.",
+      // Out of watching time, not out of luck: the cron collects every five
+      // minutes whether or not this tab is open.
+      setState("background");
+      setMessage(
+        "Still collecting in the background — safe to close this tab. Refresh the page to see results as they land.",
       );
+      router.refresh();
     } catch (e) {
       setState("error");
       setMessage(e instanceof Error ? e.message : "Check failed");
@@ -65,10 +99,17 @@ export function RankCheckButton({
       >
         {state === "running" ? "Checking…" : "Check rankings now"}
       </button>
-      {message && (
+      {message ? (
         <span className={`text-xs ${state === "error" ? "text-critical" : "text-ink-2"}`}>
           {message}
         </span>
+      ) : (
+        estimatedCost &&
+        keywordCount > 0 && (
+          <span className="text-xs text-muted" title="One Google top-100 SERP per keyword">
+            ≈{estimatedCost} for {keywordCount} keywords
+          </span>
+        )
       )}
     </span>
   );

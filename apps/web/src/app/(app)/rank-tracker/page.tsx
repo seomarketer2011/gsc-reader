@@ -6,11 +6,31 @@ import { PendingButton } from "@/components/PendingButton";
 import { RankCheckButton } from "@/components/RankCheckButton";
 import { getServerClient } from "@/lib/supabase/server";
 import { fetchUkLocations, normaliseDomain, resolveLocation, TopResult } from "@/lib/engine/serp";
+import {
+  bestOf,
+  Movement,
+  movement,
+  positionsOn,
+  RankingRow,
+  series,
+  successfulCheckDates,
+} from "@/lib/engine/rank-history";
 import { SupabaseClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
 
 const PAGE = 1000; // Supabase caps a single select at 1000 rows
+// How far back the movement comparison looks. Two checks a month apart are
+// still worth comparing; older than this and "since last check" stops meaning
+// anything useful.
+const HISTORY_DAYS = 30;
+// The expanded card shows one keyword's full run of checks, which is a single
+// cheap query — so it reaches back further than the summary does.
+const KEYWORD_HISTORY_DAYS = 180;
+// What one keyword costs at DataForSEO: a standard-queue Google organic task
+// at depth 100 is ten result pages, billed as ten. Used only to show the
+// price of a run before it is started — the real charge comes from them.
+const COST_PER_KEYWORD = 0.006;
 // Cards rendered per page-load; more via the "Show more" link. Kept modest
 // because every card is real DOM — hundreds froze the browser.
 const DISPLAY_STEP = 100;
@@ -439,6 +459,37 @@ async function retryFailedChecks(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/**
+ * Forgets this campaign's in-flight DataForSEO tasks so a new check can be
+ * started. Only for tasks that are genuinely stuck: a queue row makes its
+ * keyword ineligible for re-posting (that is what stops a double-charge), so
+ * a row whose task never comes back would otherwise block the keyword until
+ * collection expires it 24 hours later. Nothing already collected is touched.
+ */
+async function clearStuckChecks(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const keywordIds = await fetchAllRows<{ id: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("id")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  for (let i = 0; i < keywordIds.length; i += 100) {
+    await c.supabase
+      .from("serp_task_queue")
+      .delete()
+      .in(
+        "keyword_id",
+        keywordIds.slice(i, i + 100).map((k) => k.id),
+      );
+  }
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteDomain(formData: FormData) {
   "use server";
   const c = await caller();
@@ -452,6 +503,46 @@ function positionTone(position: number): "good" | "blue" | "neutral" {
   if (position <= 3) return "good";
   if (position <= 10) return "blue";
   return "neutral";
+}
+
+/**
+ * How one domain moved since the keyword's previous check. Renders nothing
+ * when there is genuinely nothing to say — a first check, or a position that
+ * held — so an unchanged SERP stays quiet instead of filling with noise.
+ */
+function MovementMark({ m, verbose = false }: { m: Movement; verbose?: boolean }) {
+  const from = m.previous === null ? "" : ` from #${m.previous}`;
+  if (m.state === "improved") {
+    return (
+      <span className="tnum font-medium text-delta-good" title={`Was #${m.previous} at the previous check`}>
+        ▲{m.change}
+        {verbose && from}
+      </span>
+    );
+  }
+  if (m.state === "declined") {
+    return (
+      <span className="tnum font-medium text-critical" title={`Was #${m.previous} at the previous check`}>
+        ▼{Math.abs(m.change ?? 0)}
+        {verbose && from}
+      </span>
+    );
+  }
+  if (m.state === "new") {
+    return (
+      <span className="font-medium text-series-1" title="Not in the top 100 at the previous check">
+        new
+      </span>
+    );
+  }
+  if (m.state === "lost") {
+    return (
+      <span className="tnum font-medium text-critical" title={`Was #${m.previous}, now outside the top 100`}>
+        dropped{verbose ? from : ` ${from.trim()}`}
+      </span>
+    );
+  }
+  return verbose ? <span className="text-muted">no change</span> : null;
 }
 
 export default async function RankTrackerPage({
@@ -526,10 +617,16 @@ export default async function RankTrackerPage({
   }
   const campaignId = campaign.id;
 
-  const cutoffDate = new Date();
-  cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
-  const cutoff = cutoffDate.toISOString().slice(0, 10);
-  const todayStr = new Date().toISOString().slice(0, 10);
+  // One clock reading for the whole render, so the cutoffs, "today" and the
+  // in-flight age all agree with each other.
+  const now = new Date();
+  const dayBefore = (days: number) => {
+    const d = new Date(now.getTime());
+    d.setUTCDate(d.getUTCDate() - days);
+    return d.toISOString().slice(0, 10);
+  };
+  const cutoff = dayBefore(HISTORY_DAYS);
+  const todayStr = now.toISOString().slice(0, 10);
 
   const [keywords, watchDomains, { data: sites }] = await Promise.all([
     fetchAllRows<{ id: string; keyword: string; location_name: string; location_valid: boolean | null }>(
@@ -589,6 +686,22 @@ export default async function RankTrackerPage({
   const checkpoints = [...new Set(watchDomains.map((w) => w.serp_location?.trim()).filter(Boolean))];
   const defaultLocation = checkpoints.length === 1 ? (checkpoints[0] as string) : "United Kingdom";
 
+  // What "Generate keywords" will actually produce, worked out the same way
+  // the action does. Two domains in the same town share one keyword set, and
+  // two towns sharing a search location share any pattern that doesn't name
+  // the town — which is why the keyword count is normally BELOW
+  // patterns × domains, and why it is spelled out on the card.
+  const townPairs = new Set<string>();
+  const searchLocations = new Set<string>();
+  for (const w of watchDomains) {
+    const town = w.location?.trim();
+    if (!town) continue;
+    const checkpoint = w.serp_location?.trim() || town;
+    townPairs.add(`${town.toLowerCase()}|${checkpoint.toLowerCase()}`);
+    searchLocations.add(checkpoint.toLowerCase());
+  }
+  const domainsWithTown = watchDomains.filter((w) => w.location?.trim()).length;
+
   // Latest check per keyword (last 30 days) + that day's rankings. Small
   // campaigns ask for their own keywords only; big ones page the org's rows
   // and filter, which is cheaper than a very long `in` list.
@@ -619,71 +732,79 @@ export default async function RankTrackerPage({
         ).filter((r) => keywordIds.has(r.keyword_id));
 
   // In-flight tasks for THIS campaign — drives the progress banner below.
+  // posted_at comes back so the banner can say how long they have been out
+  // there, which is the difference between "wait a bit" and "something stuck".
   const queued = keywords.length
-    ? await fetchAllRows<{ keyword_id: string }>((from, to) =>
+    ? await fetchAllRows<{ keyword_id: string; posted_at: string }>((from, to) =>
         c.supabase
           .from("serp_task_queue")
-          .select("keyword_id")
+          .select("keyword_id, posted_at")
           .eq("organisation_id", c.orgId)
           .order("keyword_id")
           .range(from, to),
       )
     : [];
-  const inFlight = queued.filter((r) => keywordIds.has(r.keyword_id)).length;
+  const mineInFlight = queued.filter((r) => keywordIds.has(r.keyword_id));
+  const inFlight = mineInFlight.length;
+  const oldestInFlight = mineInFlight.reduce<number | null>((oldest, r) => {
+    const at = new Date(r.posted_at).getTime();
+    return Number.isNaN(at) ? oldest : oldest === null || at < oldest ? at : oldest;
+  }, null);
+  const inFlightMinutes =
+    oldestInFlight === null ? 0 : Math.floor((now.getTime() - oldestInFlight) / 60000);
   const collectedToday = checks.filter((r) => r.check_date === todayStr).length;
 
   const latestCheck = new Map<string, { date: string; error: string | null; top: TopResult[] }>();
-  const prevCheckDate = new Map<string, string>(); // keyword -> the check before the latest
   for (const row of checks) {
-    if (!latestCheck.has(row.keyword_id)) {
-      latestCheck.set(row.keyword_id, {
-        date: row.check_date,
-        error: row.error,
-        top: row.top_results ?? [],
-      });
-    } else if (!prevCheckDate.has(row.keyword_id) && !row.error) {
-      prevCheckDate.set(row.keyword_id, row.check_date);
-    }
+    if (latestCheck.has(row.keyword_id)) continue;
+    latestCheck.set(row.keyword_id, {
+      date: row.check_date,
+      error: row.error,
+      top: row.top_results ?? [],
+    });
   }
-  const latestDates = [
-    ...new Set([...[...latestCheck.values()].map((v) => v.date), ...prevCheckDate.values()]),
+  // History = the checks that actually produced positions, newest first. The
+  // most recent two are what "since the last check" compares; the rest give
+  // the expanded card something to plot.
+  const history = successfulCheckDates(checks);
+  const currentDate = (id: string) => history.get(id)?.[0];
+  const previousDate = (id: string) => history.get(id)?.[1];
+
+  // Both dates are fetched in one go: comparing needs the previous check's
+  // rows, and there is no cheaper way to know a domain dropped out than to
+  // see where it was.
+  const comparedDates = [
+    ...new Set(
+      keywords.flatMap((k) => [currentDate(k.id), previousDate(k.id)]).filter(Boolean) as string[],
+    ),
   ];
-  const rankings = latestDates.length
+  const rankings = comparedDates.length
     ? (
-        await fetchAllRows<{ keyword_id: string; domain: string; position: number; url: string | null; check_date: string }>(
-          (from, to) => {
-            const query = c.supabase
-              .from("serp_rankings")
-              .select("keyword_id, domain, position, url, check_date");
-            return (
-              keywords.length <= SCOPED_MAX
-                ? query.in("keyword_id", [...keywordIds])
-                : query.eq("organisation_id", c.orgId)
-            )
-              .in("check_date", latestDates)
-              .order("id")
-              .range(from, to);
-          },
-        )
+        await fetchAllRows<RankingRow>((from, to) => {
+          const query = c.supabase
+            .from("serp_rankings")
+            .select("keyword_id, domain, position, url, check_date");
+          return (
+            keywords.length <= SCOPED_MAX
+              ? query.in("keyword_id", [...keywordIds])
+              : query.eq("organisation_id", c.orgId)
+          )
+            .in("check_date", comparedDates)
+            .order("id")
+            .range(from, to);
+        })
       ).filter((r) => keywordIds.has(r.keyword_id))
     : [];
-  const rankingsByKeyword = new Map<string, { domain: string; position: number; url: string }[]>();
-  const prevPosition = new Map<string, number>(); // "keywordId|domain" -> previous position
+  // Rankings are recorded for every domain the organisation watches, so a
+  // sister campaign's domains show up here — this campaign only cares about
+  // its own.
+  const rankingsByKeyword = new Map<string, RankingRow[]>();
   for (const r of rankings) {
-    // Rankings are recorded for every domain the organisation watches, so a
-    // sister campaign's domains show up here — this campaign only cares
-    // about its own.
     if (!watched.has(r.domain)) continue;
-    if (r.check_date === prevCheckDate.get(r.keyword_id)) {
-      prevPosition.set(`${r.keyword_id}|${r.domain}`, r.position);
-      continue;
-    }
-    if (r.check_date !== latestCheck.get(r.keyword_id)?.date) continue;
-    const list = rankingsByKeyword.get(r.keyword_id) ?? [];
-    list.push({ domain: r.domain, position: r.position, url: r.url ?? "" });
-    rankingsByKeyword.set(r.keyword_id, list);
+    const list = rankingsByKeyword.get(r.keyword_id);
+    if (list) list.push(r);
+    else rankingsByKeyword.set(r.keyword_id, [r]);
   }
-  for (const list of rankingsByKeyword.values()) list.sort((a, b) => a.position - b.position);
 
   // Per-keyword rollup: the town's own site vs other campaign sites (overlap).
   // Home = same checkpoint as the keyword AND, when the keyword names a
@@ -694,16 +815,45 @@ export default async function RankTrackerPage({
   const townOf = (locationName: string) => locationName.split(",")[0].trim().toLowerCase();
   const summarised = keywords.map((k) => {
     const check = latestCheck.get(k.id) ?? null;
-    const ranked = rankingsByKeyword.get(k.id) ?? [];
+    const own = rankingsByKeyword.get(k.id) ?? [];
+    const mine = (domain: string) => watched.has(domain);
+    const current = positionsOn(own, currentDate(k.id), mine);
+    const prevDate = previousDate(k.id);
+    const previous = prevDate
+      ? new Map([...positionsOn(own, prevDate, mine)].map(([d, v]) => [d, v.position]))
+      : null;
+    const movements = movement(current, previous);
+    const ranked = movements.filter((m) => m.position !== null);
+    const lost = movements.filter((m) => m.state === "lost");
+
     const town = townOf(k.location_name);
     const candidates = [...watched.entries()].filter(([, w]) => w.homeKey === town);
     const textMatches = candidates.filter(
       ([, w]) => w.homeTownLower && k.keyword.includes(w.homeTownLower),
     );
     const homeSet = new Set((textMatches.length > 0 ? textMatches : candidates).map(([d]) => d));
-    const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
+    // The home site's own row, which carries both its position now and where
+    // it was — including when "now" is nowhere at all.
+    const homeMove = bestOf(movements, homeSet);
+    const home =
+      homeMove !== null && homeMove.position !== null
+        ? { ...homeMove, position: homeMove.position }
+        : null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && watched.get(r.domain)?.homeKey);
-    return { k, check, ranked, town, hasHome: homeSet.size > 0, homeSet, home, overlap };
+    return {
+      k,
+      check,
+      movements,
+      ranked,
+      lost,
+      town,
+      hasHome: homeSet.size > 0,
+      homeSet,
+      home,
+      homeMove,
+      overlap,
+      comparedWith: prevDate ?? null,
+    };
   });
 
   // The text filter narrows EVERYTHING — stat tiles and view counts included —
@@ -720,10 +870,26 @@ export default async function RankTrackerPage({
   const homeMissing = withHome.filter((s) => !s.home).length;
   const overlapRows = checkedRows.filter((s) => s.overlap.length > 0).length;
 
+  // Movement is measured on the home site only: "did the site we run for this
+  // town go up or down since its last check". Keywords with no earlier check
+  // have nothing to say and are excluded from every count here.
+  const compared = withHome.filter((s) => s.comparedWith && s.homeMove);
+  const homeUp = compared.filter((s) => (s.homeMove!.change ?? 0) > 0);
+  const homeDown = compared.filter((s) => (s.homeMove!.change ?? 0) < 0);
+  const homeLost = compared.filter((s) => s.homeMove!.state === "lost");
+  const homeNew = compared.filter((s) => s.homeMove!.state === "new");
+  const movedRows = qFiltered.filter(
+    (s) => s.comparedWith && (s.movements.some((m) => (m.change ?? 0) !== 0) || s.lost.length > 0),
+  ).length;
+  const netHomeChange = compared.reduce((sum, s) => sum + (s.homeMove!.change ?? 0), 0);
+
   const visible = qFiltered.filter((s) => {
     if (view === "missing") return s.hasHome && s.check && !s.check.error && !s.home;
     if (view === "overlap") return s.overlap.length > 0;
     if (view === "failed") return Boolean(s.check?.error);
+    if (view === "up") return Boolean(s.comparedWith) && (s.homeMove?.change ?? 0) > 0;
+    if (view === "down") return Boolean(s.comparedWith) && (s.homeMove?.change ?? 0) < 0;
+    if (view === "lost") return Boolean(s.comparedWith) && s.lost.length > 0;
     return true;
   });
   // Order: keywords come A–Z from the query; position sorts put #1s first
@@ -744,7 +910,46 @@ export default async function RankTrackerPage({
     visible.sort(
       (a, b) => b.ranked.length - a.ranked.length || a.k.keyword.localeCompare(b.k.keyword),
     );
+  } else if (sort === "moved" || sort === "dropped") {
+    // "Biggest move" reads the home site's change; a drop out of the top 100
+    // has no number, so it is ranked as the worst possible fall. "dropped"
+    // is the same order reversed — worst news first.
+    const score = (s: (typeof summarised)[number]) =>
+      !s.comparedWith || !s.homeMove ? 0 : s.homeMove.state === "lost" ? -1000 : (s.homeMove.change ?? 0);
+    visible.sort((a, b) =>
+      sort === "moved"
+        ? Math.abs(score(b)) - Math.abs(score(a)) || a.k.keyword.localeCompare(b.k.keyword)
+        : score(a) - score(b) || a.k.keyword.localeCompare(b.k.keyword),
+    );
   }
+
+  // Full history for the one expanded keyword. Scoped to a single keyword, so
+  // it reaches back much further than the summary comparison can afford to.
+  const openKeyword = openId && keywordIds.has(openId) ? openId : "";
+  const [openChecks, openRankings] = openKeyword
+    ? await Promise.all([
+        fetchAllRows<{ keyword_id: string; check_date: string; error: string | null }>((from, to) =>
+          c.supabase
+            .from("serp_checks")
+            .select("keyword_id, check_date, error")
+            .eq("keyword_id", openKeyword)
+            .gte("check_date", dayBefore(KEYWORD_HISTORY_DAYS))
+            .order("check_date", { ascending: false })
+            .range(from, to),
+        ),
+        fetchAllRows<RankingRow>((from, to) =>
+          c.supabase
+            .from("serp_rankings")
+            .select("keyword_id, domain, position, url, check_date")
+            .eq("keyword_id", openKeyword)
+            .gte("check_date", dayBefore(KEYWORD_HISTORY_DAYS))
+            .order("check_date", { ascending: false })
+            .range(from, to),
+        ),
+      ])
+    : [[], []];
+  const openDates = (successfulCheckDates(openChecks).get(openKeyword) ?? []).slice(0, 20);
+  const openFailed = openChecks.filter((r) => r.error).length;
 
   // Every link keeps the selected campaign — it is the page's outermost scope.
   const linkParams = (overrides: Record<string, string>) => {
@@ -801,7 +1006,13 @@ export default async function RankTrackerPage({
               Export CSV{q || view !== "all" ? " (filtered)" : ""}
             </a>
           )}
-          <RankCheckButton keywordCount={keywords.length} campaignId={campaignId} />
+          <RankCheckButton
+            keywordCount={keywords.length}
+            campaignId={campaignId}
+            estimatedCost={
+              keywords.length ? `$${(keywords.length * COST_PER_KEYWORD).toFixed(2)}` : ""
+            }
+          />
         </span>
       </PageHeader>
 
@@ -831,19 +1042,46 @@ export default async function RankTrackerPage({
         </details>
       </div>
 
-      {inFlight > 0 && (
-        <Card className="mb-4 border-series-1/40 p-3 text-sm text-ink">
-          <span className="font-medium">Rank check in progress:</span>{" "}
-          <span className="tnum">
-            {collectedToday} of {keywords.length} keywords collected · {inFlight} still processing
-            at DataForSEO.
-          </span>{" "}
-          <span className="text-ink-2">
-            Results land here as they finish (refresh the page to see the latest) — collection
-            continues automatically every few minutes even if you leave or close the tab.
-          </span>
-        </Card>
-      )}
+      {inFlight > 0 &&
+        (() => {
+          // DataForSEO's standard queue normally returns everything inside 20
+          // minutes. Past an hour a task is not slow, it is stuck — and
+          // because a queued keyword is skipped by the next check (that is
+          // what stops it being paid for twice), a stuck row blocks its
+          // keyword until collection expires it. Hence the escape hatch.
+          const stuck = inFlightMinutes >= 60;
+          return (
+            <Card
+              className={`mb-4 p-3 text-sm text-ink ${stuck ? "border-warning/60" : "border-series-1/40"}`}
+            >
+              <span className="font-medium">
+                {stuck ? "Rank check stalled:" : "Rank check in progress:"}
+              </span>{" "}
+              <span className="tnum">
+                {collectedToday} of {keywords.length} keywords collected · {inFlight} still
+                processing at DataForSEO
+                {inFlightMinutes > 0 && `, oldest queued ${inFlightMinutes} min ago`}.
+              </span>{" "}
+              <span className="text-ink-2">
+                {stuck
+                  ? "Results usually land within 20 minutes, so this run has been out there far longer than it should. Collection is still retrying every few minutes and costs nothing; if it never lands, forget the in-flight tasks below and start a fresh check."
+                  : "Results land here as they finish — refresh the page to see the latest. Collection continues automatically every few minutes even if you close the tab, so nothing is lost by leaving. Nothing is charged twice: a keyword already in flight is skipped by the next check."}
+              </span>
+              {stuck && (
+                <form action={clearStuckChecks} className="mt-2">
+                  <input type="hidden" name="campaign" value={campaignId} />
+                  <PendingButton
+                    pendingLabel="Clearing…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Forget {inFlight} in-flight {inFlight === 1 ? "task" : "tasks"} (then press
+                    Check rankings now)
+                  </PendingButton>
+                </form>
+              )}
+            </Card>
+          );
+        })()}
 
       {(() => {
         const bad = keywords.filter((k) => k.location_valid === false);
@@ -904,7 +1142,7 @@ export default async function RankTrackerPage({
       })()}
 
       {keywords.length > 0 && (
-        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-3">
           <StatTile
             label={q ? `Keywords matching “${q}”` : "Keywords tracked"}
             value={String(qFiltered.length)}
@@ -916,7 +1154,37 @@ export default async function RankTrackerPage({
             detail="town's own site ranking"
           />
           <StatTile label="Home site not ranking" value={String(homeMissing)} detail="not in the top 100" />
-          <StatTile label="Keywords with overlap" value={String(overlapRows)} detail="other campaign sites in the SERP" />
+          <StatTile
+            label="Home site moved up"
+            value={compared.length ? String(homeUp.length) : "—"}
+            detail={
+              compared.length
+                ? `since the previous check${homeNew.length ? ` · ${homeNew.length} newly ranking` : ""}`
+                : "needs a second check to compare"
+            }
+          />
+          <StatTile
+            label="Home site moved down"
+            value={compared.length ? String(homeDown.length) : "—"}
+            detail={
+              compared.length
+                ? `${homeLost.length} dropped out of the top 100`
+                : "needs a second check to compare"
+            }
+          />
+          <StatTile
+            label="Net home movement"
+            value={
+              compared.length
+                ? `${netHomeChange > 0 ? "▲" : netHomeChange < 0 ? "▼" : ""}${Math.abs(netHomeChange)}`
+                : "—"
+            }
+            detail={
+              compared.length
+                ? `places across ${compared.length} compared keywords · ${overlapRows} with overlap`
+                : `${overlapRows} keywords with overlap`
+            }
+          />
         </div>
       )}
 
@@ -930,6 +1198,9 @@ export default async function RankTrackerPage({
           <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
             {viewLink("all", "All", summarised.length)}
             {viewLink("missing", "Home site missing", homeMissing)}
+            {viewLink("up", "Moved up", homeUp.length)}
+            {viewLink("down", "Moved down", homeDown.length)}
+            {viewLink("lost", "Dropped out", qFiltered.filter((s) => s.comparedWith && s.lost.length > 0).length)}
             {viewLink("overlap", "Overlap", overlapRows)}
             {viewLink("failed", "Failed checks", summarised.filter((s) => s.check?.error).length)}
             {(() => {
@@ -969,16 +1240,28 @@ export default async function RankTrackerPage({
               )}
             </span>
           </div>
-          <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
-            <span className="text-muted">Order by</span>
-            {sortLink("az", "A–Z")}
-            {sortLink("best", "Best position")}
-            {sortLink("home", "Home position")}
-            {sortLink("sites", "Sites ranking")}
+          <div className="mb-3 flex flex-wrap items-center gap-3 text-sm">
+            <span className="flex flex-wrap items-center gap-2">
+              <span className="text-muted">Order by</span>
+              {sortLink("az", "A–Z")}
+              {sortLink("best", "Best position")}
+              {sortLink("home", "Home position")}
+              {sortLink("sites", "Sites ranking")}
+              {sortLink("moved", "Biggest move")}
+              {sortLink("dropped", "Worst move")}
+            </span>
+            {movedRows > 0 && (
+              <span className="text-xs text-muted">
+                {movedRows} {movedRows === 1 ? "keyword" : "keywords"} changed since the previous
+                check
+              </span>
+            )}
           </div>
 
           <div className="space-y-3">
-            {visible.slice(0, limit).map(({ k, check, ranked, hasHome, homeSet, home, overlap }) => {
+            {visible
+              .slice(0, limit)
+              .map(({ k, check, ranked, lost, hasHome, homeSet, home, homeMove, overlap, comparedWith }) => {
               const rankedDomains = new Set(ranked.map((r) => r.domain));
               const notRankingCount = watchedTotal - rankedDomains.size;
               const isOpen = openId === k.id;
@@ -1005,14 +1288,23 @@ export default async function RankTrackerPage({
                           <>
                             {hasHome &&
                               (home ? (
-                                <Badge tone={positionTone(home.position)}>home #{home.position}</Badge>
+                                <span className="inline-flex items-center gap-1.5">
+                                  <Badge tone={positionTone(home.position)}>home #{home.position}</Badge>
+                                  {comparedWith && <MovementMark m={home} verbose />}
+                                </span>
                               ) : (
-                                <Badge tone="warning">home site not ranking</Badge>
+                                <span className="inline-flex items-center gap-1.5">
+                                  <Badge tone="warning">home site not ranking</Badge>
+                                  {homeMove?.state === "lost" && <MovementMark m={homeMove} verbose />}
+                                </span>
                               ))}
                             <span className="tnum">
                               {ranked.length} of {watchedTotal} rank
                             </span>
-                            <span className="text-muted">checked {check.date}</span>
+                            <span className="text-muted" title={comparedWith ? `Previous check ${comparedWith}` : undefined}>
+                              checked {check.date}
+                              {comparedWith ? ` · vs ${comparedWith}` : " · first check"}
+                            </span>
                           </>
                         )
                       ) : (
@@ -1044,21 +1336,8 @@ export default async function RankTrackerPage({
                             isHome(r.domain) ? "border-series-1" : "border-edge"
                           }`}
                         >
-                          <Badge tone={positionTone(r.position)}>#{r.position}</Badge>
-                          {(() => {
-                            const prev = prevPosition.get(`${k.id}|${r.domain}`);
-                            if (prev !== undefined && prev !== r.position) {
-                              return prev > r.position ? (
-                                <span className="tnum font-medium text-delta-good">▲{prev - r.position}</span>
-                              ) : (
-                                <span className="tnum font-medium text-critical">▼{r.position - prev}</span>
-                              );
-                            }
-                            if (prev === undefined && prevCheckDate.has(k.id)) {
-                              return <span className="font-medium text-series-1">new</span>;
-                            }
-                            return null;
-                          })()}
+                          <Badge tone={positionTone(r.position!)}>#{r.position}</Badge>
+                          <MovementMark m={r} />
                           <span className="text-ink-2">{r.domain}</span>
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
                           {!isHome(r.domain) && watched.get(r.domain)?.homeLabel && (
@@ -1075,6 +1354,27 @@ export default async function RankTrackerPage({
                       )}
                     </div>
                   )}
+                  {lost.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs">
+                      <span className="text-muted">Gone since {comparedWith}:</span>
+                      {(isOpen ? lost : lost.slice(0, 8)).map((m) => (
+                        <span
+                          key={m.domain}
+                          className={`inline-flex items-center gap-1 rounded-md border border-critical/40 px-1.5 py-0.5 ${
+                            isHome(m.domain) ? "font-medium" : ""
+                          }`}
+                          title={`Was #${m.previous} on ${comparedWith}, not in the top 100 now`}
+                        >
+                          <span className="tnum text-critical">was #{m.previous}</span>
+                          <span className="text-ink-2">{m.domain}</span>
+                          {isHome(m.domain) && <span className="text-series-1">home</span>}
+                        </span>
+                      ))}
+                      {!isOpen && lost.length > 8 && (
+                        <span className="text-muted">+{lost.length - 8} more</span>
+                      )}
+                    </div>
+                  )}
                   {overlap.length > 0 && (
                     <p className="mt-1.5 text-xs text-ink-2">
                       Overlap: {overlap.length} other campaign {overlap.length === 1 ? "site ranks" : "sites rank"} in
@@ -1086,6 +1386,118 @@ export default async function RankTrackerPage({
                     !check.error &&
                     (isOpen ? (
                       <div className="mt-2.5 text-xs text-ink-2">
+                        {/* Every check this keyword has ever had, newest first.
+                            One row per date, one column per domain that ranks
+                            now or ranked at any point in the window — so a
+                            site's whole run is readable left to right, and a
+                            blank cell means "checked, not in the top 100". */}
+                        <div className="mt-1">
+                          <div className="mb-1 font-medium text-ink">
+                            Position history
+                            <span className="ml-2 font-normal text-muted">
+                              {openDates.length === 0
+                                ? "no completed checks yet"
+                                : `${openDates.length} ${openDates.length === 1 ? "check" : "checks"} in the last ${KEYWORD_HISTORY_DAYS} days`}
+                              {openFailed > 0 && ` · ${openFailed} failed (not shown)`}
+                            </span>
+                          </div>
+                          {openDates.length === 0 ? (
+                            <p className="text-muted">
+                              Nothing to plot yet — history builds up one check at a time.
+                            </p>
+                          ) : (
+                            (() => {
+                              // Columns: home sites first, then anything else
+                              // that has ranked in the window. Capped so a
+                              // 292-site campaign stays readable.
+                              const seen = new Set(openRankings.map((r) => r.domain));
+                              const columns = [...watched.keys()]
+                                .filter((d) => seen.has(d))
+                                .sort((a, b) =>
+                                  isHome(a) === isHome(b) ? a.localeCompare(b) : isHome(a) ? -1 : 1,
+                                )
+                                .slice(0, 12);
+                              const rows = columns.map((domain) => ({
+                                domain,
+                                points: series(openRankings, openDates, domain),
+                              }));
+                              return (
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-full border-separate border-spacing-0 text-xs">
+                                    <thead>
+                                      <tr>
+                                        <th className="sticky left-0 bg-surface py-1 pr-3 text-left font-medium text-ink">
+                                          Domain
+                                        </th>
+                                        {openDates.map((d) => (
+                                          <th key={d} className="px-2 py-1 text-right font-medium text-muted">
+                                            {d.slice(5)}
+                                          </th>
+                                        ))}
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {rows.map(({ domain, points }) => (
+                                        <tr key={domain}>
+                                          <td
+                                            className={`sticky left-0 bg-surface py-0.5 pr-3 ${
+                                              isHome(domain) ? "font-medium text-series-1" : "text-ink-2"
+                                            }`}
+                                          >
+                                            {domain}
+                                            {isHome(domain) && " (home)"}
+                                          </td>
+                                          {points.map((p, i) => {
+                                            // Compare with the next column
+                                            // along — the dates run newest
+                                            // first, so that is the check
+                                            // before this one.
+                                            const before = points[i + 1]?.position ?? null;
+                                            const delta =
+                                              p.position !== null && before !== null
+                                                ? before - p.position
+                                                : null;
+                                            return (
+                                              <td
+                                                key={p.date}
+                                                className="tnum px-2 py-0.5 text-right"
+                                                title={`${domain} on ${p.date}`}
+                                              >
+                                                {p.position === null ? (
+                                                  <span className="text-muted">—</span>
+                                                ) : (
+                                                  <>
+                                                    <span className="text-ink">#{p.position}</span>
+                                                    {delta !== null && delta !== 0 && (
+                                                      <span
+                                                        className={
+                                                          delta > 0 ? "text-delta-good" : "text-critical"
+                                                        }
+                                                      >
+                                                        {delta > 0 ? " ▲" : " ▼"}
+                                                        {Math.abs(delta)}
+                                                      </span>
+                                                    )}
+                                                  </>
+                                                )}
+                                              </td>
+                                            );
+                                          })}
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                  <p className="mt-1 text-muted">
+                                    &ldquo;—&rdquo; means the check ran that day but the domain was
+                                    not in the organic top 100.
+                                    {seen.size > columns.length &&
+                                      ` Showing the first ${columns.length} of ${seen.size} domains that have ranked here.`}
+                                  </p>
+                                </div>
+                              );
+                            })()
+                          )}
+                        </div>
                         {check.top.length > 0 && (
                           <ol className="mt-2 space-y-0.5">
                             {check.top.map((t) => (
@@ -1271,7 +1683,28 @@ export default async function RankTrackerPage({
         </Card>
 
         <Card className="p-4">
-          <div className="mb-2 text-sm font-medium text-ink">2 · Generate keywords from patterns</div>
+          <div className="mb-2 text-sm font-medium text-ink">
+            2 · Generate keywords from patterns
+            <span className="ml-2 text-xs font-normal text-muted">
+              {keywords.length} keywords in {campaign.name}
+            </span>
+          </div>
+          {domainsWithTown > 0 && (
+            <p className="mb-2 rounded-md border border-edge bg-page px-2 py-1.5 text-xs text-ink-2">
+              <span className="font-medium text-ink">
+                {domainsWithTown} domains with a town → {townPairs.size} town/search-location{" "}
+                {townPairs.size === 1 ? "pair" : "pairs"} → {searchLocations.size} distinct search{" "}
+                {searchLocations.size === 1 ? "location" : "locations"}.
+              </span>{" "}
+              Keywords are generated per pair, not per domain, and identical keywords searched from
+              the same place are never duplicated. So a pattern containing{" "}
+              <span className="font-mono">{"{location}"}</span> adds up to {townPairs.size} keywords,
+              while one without it (&ldquo;locksmith near me&rdquo;) adds up to{" "}
+              {searchLocations.size} — one per place Google is actually queried from.
+              {domainsWithTown > townPairs.size &&
+                ` ${domainsWithTown - townPairs.size} of your domains share a town with another domain, so they share its keywords.`}
+            </p>
+          )}
           <form action={generateKeywords} className="space-y-2">
             <input type="hidden" name="campaign" value={campaignId} />
             <textarea
@@ -1296,9 +1729,11 @@ export default async function RankTrackerPage({
             </div>
             <p className="text-xs text-muted">
               Every pattern is generated for every town in this campaign and checked FROM that town
-              — “near me” style patterns too. 5 patterns × 292 towns = 1,460 keywords (~$3 per full
-              run); 5 patterns × 1 town = 5 keywords (a penny or two). Existing keywords are never
-              duplicated.
+              — “near me” style patterns too. A check costs about $
+              {COST_PER_KEYWORD.toFixed(3)} per keyword (one Google top-100 SERP), so 5 patterns ×
+              292 towns = 1,460 keywords ≈ ${(1460 * COST_PER_KEYWORD).toFixed(2)} per full run,
+              while 5 patterns × 1 town = 5 keywords is a couple of pennies. Existing keywords are
+              never duplicated.
             </p>
           </form>
           <details className="mt-3 text-xs text-ink-2">
