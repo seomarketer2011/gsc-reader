@@ -112,6 +112,7 @@ Applied migrations, in order:
 | `20260802000011_serp_task_queue.sql` | `serp_task_queue` (DataForSEO standard-queue tasks in flight) |
 | `20260802000012_rank_tracker_campaigns.sql` | `campaign_id` required on both tracked tables; existing data backfilled into one campaign per org; uniqueness moved under the campaign |
 | `20260802000013_keyword_location_validation.sql` | `tracked_keywords.location_valid` |
+| `20260802000014_serp_depth.sql` | `campaigns.serp_depth` (how deep checks look), `serp_checks.depth` + `serp_task_queue.depth` (depth each result/task was taken at) |
 
 **When adding a migration:** write a new timestamped `.sql` file, validate it
 (there is a PGlite validator harness used during development — apply all
@@ -254,12 +255,19 @@ pause the project.
 
 ### Rank tracker: what a check costs and how long it takes
 
-- **Cost.** One keyword = one Google top-100 SERP = **about $0.006** on
-  DataForSEO's standard queue (depth 100 is ten result pages, billed as ten).
-  A 477-keyword campaign is ~$2.90 a run; the button shows the estimate before
-  you press it. Check the balance at
-  `https://api.dataforseo.com/v3/appendix/user_data` — a run that would
-  overdraw it fails at posting time.
+- **Cost.** DataForSEO bills **$0.0006 per page of ten results** it has to
+  fetch, so the campaign's depth setting (on the rank-tracker page, "How deep
+  to look") is the one cost lever and scales exactly: top 100 = $0.006 per
+  keyword, top 50 = $0.003, top 30 = $0.0018, top 20 = $0.0012, top 10 =
+  $0.0006. A 477-keyword campaign is ~$2.86 a run at top 100, ~$1.43 at top
+  50, ~$0.57 at top 20. The button shows the estimate before you press it.
+  Check the balance at `https://api.dataforseo.com/v3/appendix/user_data`.
+- **Depth trade-off.** A site below the chosen depth is indistinguishable
+  from one that doesn't rank, and striking-distance work lives at #11–30 —
+  so shallow depths suit watching a network's winners, not moving a site.
+  Every stored result records the depth it was taken at; reducing the depth
+  marks sites below the new limit "out of range" instead of reporting them
+  as dropped.
 - **Timing.** Tasks are posted in seconds and normally come back within a
   couple of minutes, worst case ~20. The page shows how many are still in
   flight and how long the oldest has been out there; past **60 minutes** it

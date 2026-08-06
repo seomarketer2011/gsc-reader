@@ -23,11 +23,14 @@ export function RankCheckButton({
   keywordCount,
   campaignId,
   estimatedCost = "",
+  depth = 100,
 }: {
   keywordCount: number;
   campaignId: string;
   /** Pre-formatted price of a full run, e.g. "$2.86". Shown before starting. */
   estimatedCost?: string;
+  /** How far down the results this campaign's checks look. */
+  depth?: number;
 }) {
   const router = useRouter();
   const [state, setState] = useState<"idle" | "running" | "done" | "background" | "error">("idle");
@@ -106,8 +109,11 @@ export function RankCheckButton({
       ) : (
         estimatedCost &&
         keywordCount > 0 && (
-          <span className="text-xs text-muted" title="One Google top-100 SERP per keyword">
-            ≈{estimatedCost} for {keywordCount} keywords
+          <span
+            className="text-xs text-muted"
+            title={`One Google SERP per keyword, read to position ${depth}`}
+          >
+            ≈{estimatedCost} for {keywordCount} keywords · top {depth}
           </span>
         )
       )}

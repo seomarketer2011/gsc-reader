@@ -11,6 +11,9 @@ export interface CheckRow {
   keyword_id: string;
   check_date: string;
   error: string | null;
+  /** How far down the results this check looked. Null on rows written before
+   * depth was configurable, when 100 was hard-coded — so null reads as 100. */
+  depth?: number | null;
 }
 
 export interface RankingRow {
@@ -32,8 +35,14 @@ export type MovementState =
   | "declined"
   /** Same position as last time. */
   | "held"
-  /** Ranked last time, gone from the top 100 now. */
-  | "lost";
+  /** Ranked last time, gone from the results now. */
+  | "lost"
+  /** Ranked last time at a position this check no longer reaches — the
+   * campaign's depth was reduced, so this is a blind spot, not a fall. */
+  | "out_of_range"
+  /** Ranking now at a position the previous, shallower check could not have
+   * seen. It may have been there all along; there is no way to tell. */
+  | "unseen_before";
 
 export interface Movement {
   domain: string;
@@ -71,16 +80,25 @@ export function successfulCheckDates(checks: CheckRow[]): Map<string, string[]> 
 
 /**
  * Current vs previous positions for one keyword. Every domain in either check
- * gets a row, so a site that fell out of the top 100 surfaces as "lost"
+ * gets a row, so a site that fell out of the results surfaces as "lost"
  * instead of quietly vanishing from the card.
  *
  * `previous` is null when the keyword has only ever been checked once — that
  * is different from "was absent last time", and the two must not look alike.
+ *
+ * `depths` matters whenever a campaign's depth setting has changed between
+ * the two checks. Dropping from 100 to 20 would otherwise report every site
+ * that sat at #21–100 as having crashed out overnight; those are reported as
+ * blind spots instead. The reverse — a site appearing at #60 when the last
+ * check only looked at 20 — is not treated as an arrival either.
  */
 export function movement(
   current: Map<string, { position: number; url: string }>,
   previous: Map<string, number> | null,
+  depths?: { current?: number | null; previous?: number | null },
 ): Movement[] {
+  const nowDepth = depths?.current ?? null;
+  const thenDepth = depths?.previous ?? null;
   const out: Movement[] = [];
   for (const [domain, now] of current) {
     if (!previous) {
@@ -88,6 +106,9 @@ export function movement(
       continue;
     }
     const was = previous.get(domain) ?? null;
+    // Absent last time, but beyond what last time could see: unknowable, so
+    // it must not be sold as a new arrival.
+    const beyondOldDepth = was === null && thenDepth !== null && now.position > thenDepth;
     out.push({
       domain,
       url: now.url,
@@ -96,7 +117,9 @@ export function movement(
       change: was === null ? null : was - now.position,
       state:
         was === null
-          ? "new"
+          ? beyondOldDepth
+            ? "unseen_before"
+            : "new"
           : was > now.position
             ? "improved"
             : was < now.position
@@ -107,7 +130,17 @@ export function movement(
   if (previous) {
     for (const [domain, was] of previous) {
       if (current.has(domain)) continue;
-      out.push({ domain, url: "", position: null, previous: was, change: null, state: "lost" });
+      // Was sitting deeper than this check bothered to look — a gap in what
+      // we asked for, not a drop.
+      const beyondNewDepth = nowDepth !== null && was > nowDepth;
+      out.push({
+        domain,
+        url: "",
+        position: null,
+        previous: was,
+        change: null,
+        state: beyondNewDepth ? "out_of_range" : "lost",
+      });
     }
   }
   // Best position first; dropped-out domains last, ordered by where they were.
@@ -158,6 +191,19 @@ export function series(rankings: RankingRow[], dates: string[], domain: string):
     if (existing === undefined || r.position < existing) byDate.set(r.check_date, r.position);
   }
   return dates.map((date) => ({ date, position: byDate.get(date) ?? null }));
+}
+
+/**
+ * The depth each check was taken at, keyed "keywordId|date". `fallback` fills
+ * in rows written before depth was recorded — the caller owns that value
+ * because it is a property of the SERP engine, not of this arithmetic.
+ */
+export function depthByCheck(checks: CheckRow[], fallback: number): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const row of checks) {
+    out.set(`${row.keyword_id}|${row.check_date}`, row.depth ?? fallback);
+  }
+  return out;
 }
 
 /** Rankings for one date, keyed by domain — the shape `movement` wants. */

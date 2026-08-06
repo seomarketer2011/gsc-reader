@@ -16,6 +16,22 @@ export interface TrackedKeyword {
   location_name: string;
 }
 
+/**
+ * How far down the results a check looks — and the only real cost lever.
+ * DataForSEO bills a page of ten at a time, charging for the pages it had to
+ * fetch up to this cap, so halving the depth halves the bill.
+ *
+ * Everything stored before the setting existed was taken at 100, which is why
+ * a null depth reads as 100 rather than as "unknown".
+ */
+export const DEFAULT_DEPTH = 100;
+export const DEPTH_CHOICES = [100, 50, 30, 20, 10] as const;
+/** Dollars per keyword at a given depth: $0.0006 per page of ten. */
+export const COST_PER_PAGE = 0.0006;
+export const costAtDepth = (depth: number) => (depth / 10) * COST_PER_PAGE;
+export const normaliseDepth = (depth: number | null | undefined): number =>
+  depth && (DEPTH_CHOICES as readonly number[]).includes(depth) ? depth : DEFAULT_DEPTH;
+
 export interface WatchedDomain {
   domain: string; // normalised: lowercase, no protocol/www/path
   siteId: string | null; // sites.id when GSC-connected
@@ -144,7 +160,11 @@ interface SerpItem {
  * internal errors, HTTP 5xx, network drops) are retried with backoff —
  * they usually succeed on the next attempt and failed tasks aren't charged.
  * Permanent errors (bad location name, auth) throw immediately. */
-async function fetchSerp(keyword: string, locationName: string): Promise<SerpItem[]> {
+async function fetchSerp(
+  keyword: string,
+  locationName: string,
+  depth: number,
+): Promise<SerpItem[]> {
   const auth = Buffer.from(
     `${process.env.DATAFORSEO_LOGIN}:${process.env.DATAFORSEO_PASSWORD}`,
   ).toString("base64");
@@ -157,7 +177,7 @@ async function fetchSerp(keyword: string, locationName: string): Promise<SerpIte
         method: "POST",
         headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
         body: JSON.stringify([
-          { keyword, location_name: locationName, language_name: "English", depth: 100 },
+          { keyword, location_name: locationName, language_name: "English", depth },
         ]),
       });
     } catch (e) {
@@ -193,11 +213,18 @@ async function recordCheckError(
   orgId: string,
   keywordId: string,
   error: string,
+  depth: number,
 ): Promise<void> {
   await service
     .from("serp_checks")
     .upsert(
-      { organisation_id: orgId, keyword_id: keywordId, error: error.slice(0, 300), top_results: [] },
+      {
+        organisation_id: orgId,
+        keyword_id: keywordId,
+        error: error.slice(0, 300),
+        top_results: [],
+        depth,
+      },
       { onConflict: "keyword_id,check_date" },
     );
 }
@@ -211,6 +238,7 @@ async function storeSerpResult(
   keywordId: string,
   items: SerpItem[],
   watched: WatchedDomain[],
+  depth: number,
 ): Promise<number> {
   const organic = items.filter((i) => i.type === "organic" && i.domain);
   const topResults: TopResult[] = organic.slice(0, 10).map((i) => ({
@@ -235,7 +263,7 @@ async function storeSerpResult(
   await service
     .from("serp_checks")
     .upsert(
-      { organisation_id: orgId, keyword_id: keywordId, error: null, top_results: topResults },
+      { organisation_id: orgId, keyword_id: keywordId, error: null, top_results: topResults, depth },
       { onConflict: "keyword_id,check_date" },
     );
   // Replace today's rankings for this keyword so re-runs stay consistent.
@@ -266,16 +294,17 @@ export async function checkKeyword(
   orgId: string,
   keyword: TrackedKeyword,
   watched: WatchedDomain[],
+  depth: number = DEFAULT_DEPTH,
 ): Promise<{ ranked: number; error: string | null }> {
   let items: SerpItem[];
   try {
-    items = await fetchSerp(keyword.keyword, keyword.location_name);
+    items = await fetchSerp(keyword.keyword, keyword.location_name, depth);
   } catch (e) {
     const error = e instanceof Error ? e.message.slice(0, 300) : "SERP fetch failed";
-    await recordCheckError(service, orgId, keyword.id, error);
+    await recordCheckError(service, orgId, keyword.id, error, depth);
     return { ranked: 0, error };
   }
-  const ranked = await storeSerpResult(service, orgId, keyword.id, items, watched);
+  const ranked = await storeSerpResult(service, orgId, keyword.id, items, watched, depth);
   return { ranked, error: null };
 }
 
@@ -296,6 +325,7 @@ export async function postSerpTasks(
   service: SupabaseClient,
   orgId: string,
   keywords: TrackedKeyword[],
+  depth: number = DEFAULT_DEPTH,
 ): Promise<number> {
   let posted = 0;
   for (let i = 0; i < keywords.length; i += TASK_POST_BATCH) {
@@ -308,7 +338,7 @@ export async function postSerpTasks(
           keyword: k.keyword,
           location_name: k.location_name,
           language_name: "English",
-          depth: 100,
+          depth,
           priority: 1,
           tag: k.id,
         })),
@@ -316,14 +346,17 @@ export async function postSerpTasks(
     });
     if (!res.ok) throw new Error(`DataForSEO task_post HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
-    const rows: { organisation_id: string; keyword_id: string; task_id: string }[] = [];
+    // The depth travels with the queue row, not looked up at collection time:
+    // changing the campaign's setting while tasks are in flight must not
+    // relabel results that were already fetched at the old depth.
+    const rows: { organisation_id: string; keyword_id: string; task_id: string; depth: number }[] = [];
     for (const t of data.tasks ?? []) {
       const keywordId = t.data?.tag as string | undefined;
       if (!keywordId) continue;
       if (t.status_code === 20100 && t.id) {
-        rows.push({ organisation_id: orgId, keyword_id: keywordId, task_id: t.id as string });
+        rows.push({ organisation_id: orgId, keyword_id: keywordId, task_id: t.id as string, depth });
       } else {
-        await recordCheckError(service, orgId, keywordId, `task_post ${t.status_code}: ${t.status_message}`);
+        await recordCheckError(service, orgId, keywordId, `task_post ${t.status_code}: ${t.status_message}`, depth);
       }
     }
     if (rows.length > 0) {
@@ -344,6 +377,8 @@ interface QueueRow {
   keyword_id: string;
   task_id: string;
   posted_at: string;
+  /** Depth the task was posted with; null on rows predating the setting. */
+  depth: number | null;
 }
 
 /**
@@ -368,7 +403,7 @@ export async function collectSerpResults(
   for (let from = 0; ; from += QUEUE_PAGE) {
     const { data } = await service
       .from("serp_task_queue")
-      .select("id, keyword_id, task_id, posted_at")
+      .select("id, keyword_id, task_id, posted_at, depth")
       .eq("organisation_id", orgId)
       .order("posted_at")
       .range(from, from + QUEUE_PAGE - 1);
@@ -394,7 +429,13 @@ export async function collectSerpResults(
       } else if (r.tag && keywordIds?.has(r.tag as string)) {
         // Orphan: finished task tagged with one of our keywords but no queue
         // row — synthesise one in memory so it's collected and stored.
-        byTaskId.set(id, { id: "", keyword_id: r.tag as string, task_id: id, posted_at: nowIso });
+        byTaskId.set(id, {
+          id: "",
+          keyword_id: r.tag as string,
+          task_id: id,
+          posted_at: nowIso,
+          depth: null,
+        });
         readyIds.push(id);
       }
     }
@@ -459,6 +500,7 @@ export async function collectSerpResults(
       organisation_id: orgId,
       keyword_id: row.keyword_id,
       error: null,
+      depth: normaliseDepth(row.depth),
       top_results: organic.slice(0, 10).map((i) => ({
         position: i.rank_group,
         domain: normaliseDomain(i.domain!),
@@ -492,6 +534,7 @@ export async function collectSerpResults(
       organisation_id: orgId,
       keyword_id: row.keyword_id,
       error: message.slice(0, 300),
+      depth: normaliseDepth(row.depth),
       top_results: [],
     });
   }

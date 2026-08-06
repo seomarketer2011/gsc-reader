@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   bestOf,
+  depthByCheck,
   movement,
   positionsOn,
   RankingRow,
@@ -97,6 +98,66 @@ describe("movement", () => {
     const first = movement(now, null);
     expect(first).toHaveLength(4);
     expect(first.every((m) => m.state === "first" && m.change === null)).toBe(true);
+  });
+});
+
+describe("movement across a depth change", () => {
+  it("marks a site below the new, shallower depth as out of range, not lost", () => {
+    const moves = movement(
+      new Map([["top.co.uk", { position: 3, url: "" }]]),
+      new Map([
+        ["top.co.uk", 5],
+        ["deep.co.uk", 61],
+        ["shallow.co.uk", 15],
+      ]),
+      { current: 20, previous: 100 },
+    );
+    const byDomain = new Map(moves.map((m) => [m.domain, m]));
+    // #61 is beyond what a top-20 check looks at — a blind spot.
+    expect(byDomain.get("deep.co.uk")).toMatchObject({ state: "out_of_range", previous: 61 });
+    // #15 WAS within reach of the new depth, so its absence is a real loss.
+    expect(byDomain.get("shallow.co.uk")).toMatchObject({ state: "lost", previous: 15 });
+    expect(byDomain.get("top.co.uk")).toMatchObject({ state: "improved", change: 2 });
+  });
+
+  it("does not sell a deep position as a new arrival after the depth increased", () => {
+    const moves = movement(
+      new Map([
+        ["deep.co.uk", { position: 60, url: "" }],
+        ["fresh.co.uk", { position: 12, url: "" }],
+      ]),
+      new Map(),
+      { current: 100, previous: 20 },
+    );
+    const byDomain = new Map(moves.map((m) => [m.domain, m]));
+    // #60 was invisible to a top-20 check — it may have been there all along.
+    expect(byDomain.get("deep.co.uk")?.state).toBe("unseen_before");
+    // #12 was within the old depth's view, so it genuinely arrived.
+    expect(byDomain.get("fresh.co.uk")?.state).toBe("new");
+  });
+
+  it("behaves exactly as before when no depths are given", () => {
+    const moves = movement(
+      new Map([["a.co.uk", { position: 60, url: "" }]]),
+      new Map([["b.co.uk", 90]]),
+    );
+    const byDomain = new Map(moves.map((m) => [m.domain, m]));
+    expect(byDomain.get("a.co.uk")?.state).toBe("new");
+    expect(byDomain.get("b.co.uk")?.state).toBe("lost");
+  });
+});
+
+describe("depthByCheck", () => {
+  it("keys by keyword and date, filling unrecorded rows with the fallback", () => {
+    const depths = depthByCheck(
+      [
+        { keyword_id: "k1", check_date: "2026-08-06", error: null, depth: 20 },
+        { keyword_id: "k1", check_date: "2026-08-03", error: null, depth: null },
+      ],
+      100,
+    );
+    expect(depths.get("k1|2026-08-06")).toBe(20);
+    expect(depths.get("k1|2026-08-03")).toBe(100);
   });
 });
 

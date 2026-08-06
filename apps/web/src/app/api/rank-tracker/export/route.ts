@@ -1,7 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerClient } from "@/lib/supabase/server";
-import { normaliseDomain, TopResult } from "@/lib/engine/serp";
-import { movement, positionsOn, RankingRow, successfulCheckDates } from "@/lib/engine/rank-history";
+import { DEFAULT_DEPTH, normaliseDomain, TopResult } from "@/lib/engine/serp";
+import {
+  depthByCheck,
+  movement,
+  positionsOn,
+  RankingRow,
+  successfulCheckDates,
+} from "@/lib/engine/rank-history";
 
 // CSV of the latest check per keyword in ONE campaign (?campaign=): one row
 // per ranked watched domain, plus a row for any home-town domain that is NOT
@@ -85,10 +91,10 @@ export async function GET(request: NextRequest) {
     all<{ domain: string; location: string | null; serp_location: string | null }>((f, t) =>
       supabase!.from("tracked_domains").select("domain, location, serp_location").eq("campaign_id", campaignId).order("domain").range(f, t),
     ),
-    all<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>((f, t) =>
+    all<{ keyword_id: string; check_date: string; error: string | null; depth: number | null; top_results: TopResult[] }>((f, t) =>
       supabase!
         .from("serp_checks")
-        .select("keyword_id, check_date, error, top_results")
+        .select("keyword_id, check_date, error, depth, top_results")
         .eq("organisation_id", orgId)
         .gte("check_date", cutoff)
         .order("check_date", { ascending: false })
@@ -108,6 +114,11 @@ export async function GET(request: NextRequest) {
   const history = successfulCheckDates(mineChecks);
   const currentDate = (id: string) => history.get(id)?.[0];
   const previousDate = (id: string) => history.get(id)?.[1];
+  // Depth per stored check, so reducing a campaign's depth exports "out of
+  // range" blind spots rather than a wave of phantom drop-outs.
+  const checkDepths = depthByCheck(mineChecks, DEFAULT_DEPTH);
+  const depthAt = (id: string, date: string | undefined) =>
+    date ? (checkDepths.get(`${id}|${date}`) ?? DEFAULT_DEPTH) : null;
   const comparedDates = [
     ...new Set(
       keywords.flatMap((k) => [currentDate(k.id), previousDate(k.id)]).filter(Boolean) as string[],
@@ -166,14 +177,17 @@ export async function GET(request: NextRequest) {
     const own = rowsByKeyword.get(k.id) ?? [];
     const mine = (domain: string) => campaignDomains.has(domain);
     const prevDate = previousDate(k.id);
+    const nowDate = currentDate(k.id);
     const movements = movement(
-      positionsOn(own, currentDate(k.id), mine),
+      positionsOn(own, nowDate, mine),
       prevDate
         ? new Map([...positionsOn(own, prevDate, mine)].map(([d, v]) => [d, v.position]))
         : null,
+      { current: depthAt(k.id, nowDate), previous: depthAt(k.id, prevDate) },
     );
     const ranked = movements.filter((m) => m.position !== null);
     const lost = movements.filter((m) => m.state === "lost");
+    const outOfRange = movements.filter((m) => m.state === "out_of_range");
     const candidates = [...homeKey.entries()].filter(([, key]) => key === town).map(([d]) => d);
     const textMatches = candidates.filter((d) => {
       const t = homeTownLower.get(d);
@@ -190,6 +204,7 @@ export async function GET(request: NextRequest) {
       movements,
       ranked,
       lost,
+      outOfRange,
       hasHome: homeSet.size > 0,
       homeSet,
       home,

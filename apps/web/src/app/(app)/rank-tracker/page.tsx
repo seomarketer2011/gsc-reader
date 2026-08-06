@@ -5,9 +5,20 @@ import { Badge, Card, EmptyState, PageHeader, StatTile } from "@/components/ui";
 import { PendingButton } from "@/components/PendingButton";
 import { RankCheckButton } from "@/components/RankCheckButton";
 import { getServerClient } from "@/lib/supabase/server";
-import { fetchUkLocations, normaliseDomain, resolveLocation, TopResult } from "@/lib/engine/serp";
+import {
+  costAtDepth,
+  COST_PER_PAGE,
+  DEFAULT_DEPTH,
+  DEPTH_CHOICES,
+  fetchUkLocations,
+  normaliseDepth,
+  normaliseDomain,
+  resolveLocation,
+  TopResult,
+} from "@/lib/engine/serp";
 import {
   bestOf,
+  depthByCheck,
   Movement,
   movement,
   positionsOn,
@@ -27,10 +38,10 @@ const HISTORY_DAYS = 30;
 // The expanded card shows one keyword's full run of checks, which is a single
 // cheap query — so it reaches back further than the summary does.
 const KEYWORD_HISTORY_DAYS = 180;
-// What one keyword costs at DataForSEO: a standard-queue Google organic task
-// at depth 100 is ten result pages, billed as ten. Used only to show the
-// price of a run before it is started — the real charge comes from them.
-const COST_PER_KEYWORD = 0.006;
+/** "$2.86" for a run of this many keywords at this depth. */
+const runCost = (keywords: number, depth: number) =>
+  `$${(keywords * costAtDepth(depth)).toFixed(2)}`;
+const COST_PER_PAGE_LABEL = COST_PER_PAGE.toFixed(4);
 // Cards rendered per page-load; more via the "Show more" link. Kept modest
 // because every card is real DOM — hundreds froze the browser.
 const DISPLAY_STEP = 100;
@@ -128,6 +139,21 @@ async function createCampaign(formData: FormData) {
   }
   revalidatePath("/", "layout"); // campaigns also feed the global View selector
   if (id) redirect(`/rank-tracker?campaign=${id}`);
+}
+
+/**
+ * How far down the results this campaign's checks look — the one setting that
+ * changes what a run costs, because DataForSEO bills by the page of ten it
+ * had to fetch. Stored per campaign, and stamped onto every check from here
+ * on, so reducing it later can be told apart from sites actually falling out.
+ */
+async function setCampaignDepth(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const depth = normaliseDepth(Number(formData.get("depth")));
+  await c.supabase.from("campaigns").update({ serp_depth: depth }).eq("id", c.campaignId);
+  revalidatePath("/rank-tracker");
 }
 
 async function renameCampaign(formData: FormData) {
@@ -530,15 +556,35 @@ function MovementMark({ m, verbose = false }: { m: Movement; verbose?: boolean }
   }
   if (m.state === "new") {
     return (
-      <span className="font-medium text-series-1" title="Not in the top 100 at the previous check">
+      <span className="font-medium text-series-1" title="Not in the results at the previous check">
         new
       </span>
     );
   }
   if (m.state === "lost") {
     return (
-      <span className="tnum font-medium text-critical" title={`Was #${m.previous}, now outside the top 100`}>
+      <span className="tnum font-medium text-critical" title={`Was #${m.previous}, now outside the checked results`}>
         dropped{verbose ? from : ` ${from.trim()}`}
+      </span>
+    );
+  }
+  // The two states that exist only because the campaign's depth changed. They
+  // are deliberately not coloured as good or bad: nothing is known to have
+  // happened, we simply stopped (or started) looking that far.
+  if (m.state === "out_of_range") {
+    return (
+      <span
+        className="tnum text-muted"
+        title={`Was #${m.previous}, which is deeper than this check looked — not a drop`}
+      >
+        out of range{verbose ? from : ""}
+      </span>
+    );
+  }
+  if (m.state === "unseen_before") {
+    return (
+      <span className="text-muted" title="Deeper than the previous check looked, so there is no way to tell whether it moved">
+        first seen
       </span>
     );
   }
@@ -574,10 +620,14 @@ export default async function RankTrackerPage({
 
   const { data: campaignRows } = await c.supabase
     .from("campaigns")
-    .select("id, name")
+    .select("id, name, serp_depth")
     .eq("organisation_id", c.orgId)
     .order("name");
-  const campaigns = (campaignRows ?? []) as { id: string; name: string }[];
+  const campaigns = (campaignRows ?? []) as {
+    id: string;
+    name: string;
+    serp_depth: number | null;
+  }[];
   const requested = typeof params.campaign === "string" ? params.campaign : "";
   const campaign = campaigns.find((x) => x.id === requested) ?? campaigns[0] ?? null;
 
@@ -616,6 +666,9 @@ export default async function RankTrackerPage({
     );
   }
   const campaignId = campaign.id;
+  // What the NEXT check will look at. Results already stored keep whatever
+  // depth they were taken at.
+  const depth = normaliseDepth(campaign.serp_depth);
 
   // One clock reading for the whole render, so the cutoffs, "today" and the
   // in-flight age all agree with each other.
@@ -705,29 +758,35 @@ export default async function RankTrackerPage({
   // Latest check per keyword (last 30 days) + that day's rankings. Small
   // campaigns ask for their own keywords only; big ones page the org's rows
   // and filter, which is cheaper than a very long `in` list.
+  type CheckRecord = {
+    keyword_id: string;
+    check_date: string;
+    error: string | null;
+    depth: number | null;
+    top_results: TopResult[];
+  };
+  const CHECK_COLUMNS = "keyword_id, check_date, error, depth, top_results";
   const checks = !keywords.length
     ? []
     : keywords.length <= SCOPED_MAX
-      ? await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
-          (from, to) =>
+      ? await fetchAllRows<CheckRecord>((from, to) =>
+          c.supabase
+            .from("serp_checks")
+            .select(CHECK_COLUMNS)
+            .in("keyword_id", [...keywordIds])
+            .gte("check_date", cutoff)
+            .order("check_date", { ascending: false })
+            .range(from, to),
+        )
+      : (
+          await fetchAllRows<CheckRecord>((from, to) =>
             c.supabase
               .from("serp_checks")
-              .select("keyword_id, check_date, error, top_results")
-              .in("keyword_id", [...keywordIds])
+              .select(CHECK_COLUMNS)
+              .eq("organisation_id", c.orgId)
               .gte("check_date", cutoff)
               .order("check_date", { ascending: false })
               .range(from, to),
-        )
-      : (
-          await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
-            (from, to) =>
-              c.supabase
-                .from("serp_checks")
-                .select("keyword_id, check_date, error, top_results")
-                .eq("organisation_id", c.orgId)
-                .gte("check_date", cutoff)
-                .order("check_date", { ascending: false })
-                .range(from, to),
           )
         ).filter((r) => keywordIds.has(r.keyword_id));
 
@@ -769,6 +828,11 @@ export default async function RankTrackerPage({
   const history = successfulCheckDates(checks);
   const currentDate = (id: string) => history.get(id)?.[0];
   const previousDate = (id: string) => history.get(id)?.[1];
+  // Depth per stored check, so a campaign that has been made shallower does
+  // not report every site below the new depth as having crashed out.
+  const checkDepths = depthByCheck(checks, DEFAULT_DEPTH);
+  const depthAt = (id: string, date: string | undefined) =>
+    date ? (checkDepths.get(`${id}|${date}`) ?? DEFAULT_DEPTH) : null;
 
   // Both dates are fetched in one go: comparing needs the previous check's
   // rows, and there is no cheaper way to know a domain dropped out than to
@@ -822,9 +886,14 @@ export default async function RankTrackerPage({
     const previous = prevDate
       ? new Map([...positionsOn(own, prevDate, mine)].map(([d, v]) => [d, v.position]))
       : null;
-    const movements = movement(current, previous);
+    const checkDepth = depthAt(k.id, currentDate(k.id));
+    const movements = movement(current, previous, {
+      current: checkDepth,
+      previous: depthAt(k.id, prevDate),
+    });
     const ranked = movements.filter((m) => m.position !== null);
     const lost = movements.filter((m) => m.state === "lost");
+    const outOfRange = movements.filter((m) => m.state === "out_of_range");
 
     const town = townOf(k.location_name);
     const candidates = [...watched.entries()].filter(([, w]) => w.homeKey === town);
@@ -846,6 +915,8 @@ export default async function RankTrackerPage({
       movements,
       ranked,
       lost,
+      outOfRange,
+      checkDepth: checkDepth ?? depth,
       town,
       hasHome: homeSet.size > 0,
       homeSet,
@@ -1009,9 +1080,8 @@ export default async function RankTrackerPage({
           <RankCheckButton
             keywordCount={keywords.length}
             campaignId={campaignId}
-            estimatedCost={
-              keywords.length ? `$${(keywords.length * COST_PER_KEYWORD).toFixed(2)}` : ""
-            }
+            estimatedCost={keywords.length ? runCost(keywords.length, depth) : ""}
+            depth={depth}
           />
         </span>
       </PageHeader>
@@ -1153,27 +1223,27 @@ export default async function RankTrackerPage({
             value={withHome.length ? `${homeTop10} / ${withHome.length}` : "—"}
             detail="town's own site ranking"
           />
-          <StatTile label="Home site not ranking" value={String(homeMissing)} detail="not in the top 100" />
+          <StatTile label="Home site not ranking" value={String(homeMissing)} detail={`not in the top ${depth}`} />
           <StatTile
-            label="Home site moved up"
+            label="Keywords ranking higher"
             value={compared.length ? String(homeUp.length) : "—"}
             detail={
               compared.length
-                ? `since the previous check${homeNew.length ? ` · ${homeNew.length} newly ranking` : ""}`
+                ? `town's own site climbed since the last check${homeNew.length ? ` · ${homeNew.length} newly ranking` : ""}`
                 : "needs a second check to compare"
             }
           />
           <StatTile
-            label="Home site moved down"
+            label="Keywords ranking lower"
             value={compared.length ? String(homeDown.length) : "—"}
             detail={
               compared.length
-                ? `${homeLost.length} dropped out of the top 100`
+                ? `town's own site slipped since the last check${homeLost.length ? ` · ${homeLost.length} dropped out entirely` : ""}`
                 : "needs a second check to compare"
             }
           />
           <StatTile
-            label="Net home movement"
+            label="Net movement"
             value={
               compared.length
                 ? `${netHomeChange > 0 ? "▲" : netHomeChange < 0 ? "▼" : ""}${Math.abs(netHomeChange)}`
@@ -1181,7 +1251,7 @@ export default async function RankTrackerPage({
             }
             detail={
               compared.length
-                ? `places across ${compared.length} compared keywords · ${overlapRows} with overlap`
+                ? `positions gained minus lost, across ${compared.length} keywords with two checks`
                 : `${overlapRows} keywords with overlap`
             }
           />
@@ -1261,7 +1331,7 @@ export default async function RankTrackerPage({
           <div className="space-y-3">
             {visible
               .slice(0, limit)
-              .map(({ k, check, ranked, lost, hasHome, homeSet, home, homeMove, overlap, comparedWith }) => {
+              .map(({ k, check, ranked, lost, outOfRange, checkDepth, hasHome, homeSet, home, homeMove, overlap, comparedWith }) => {
               const rankedDomains = new Set(ranked.map((r) => r.domain));
               const notRankingCount = watchedTotal - rankedDomains.size;
               const isOpen = openId === k.id;
@@ -1337,7 +1407,7 @@ export default async function RankTrackerPage({
                           }`}
                         >
                           <Badge tone={positionTone(r.position!)}>#{r.position}</Badge>
-                          <MovementMark m={r} />
+                          <MovementMark m={r} verbose />
                           <span className="text-ink-2">{r.domain}</span>
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
                           {!isHome(r.domain) && watched.get(r.domain)?.homeLabel && (
@@ -1363,7 +1433,7 @@ export default async function RankTrackerPage({
                           className={`inline-flex items-center gap-1 rounded-md border border-critical/40 px-1.5 py-0.5 ${
                             isHome(m.domain) ? "font-medium" : ""
                           }`}
-                          title={`Was #${m.previous} on ${comparedWith}, not in the top 100 now`}
+                          title={`Was #${m.previous} on ${comparedWith}, not in the checked results now`}
                         >
                           <span className="tnum text-critical">was #{m.previous}</span>
                           <span className="text-ink-2">{m.domain}</span>
@@ -1374,6 +1444,18 @@ export default async function RankTrackerPage({
                         <span className="text-muted">+{lost.length - 8} more</span>
                       )}
                     </div>
+                  )}
+                  {outOfRange.length > 0 && (
+                    <p className="mt-1.5 text-xs text-muted">
+                      {outOfRange.length}{" "}
+                      {outOfRange.length === 1 ? "domain was" : "domains were"} ranked below #
+                      {checkDepth} at the previous check, which this one didn&rsquo;t look at — not
+                      counted as dropped ({outOfRange
+                        .slice(0, 4)
+                        .map((m) => `${m.domain} #${m.previous}`)
+                        .join(" · ")}
+                      {outOfRange.length > 4 ? ` · +${outOfRange.length - 4} more` : ""}).
+                    </p>
                   )}
                   {overlap.length > 0 && (
                     <p className="mt-1.5 text-xs text-ink-2">
@@ -1390,7 +1472,7 @@ export default async function RankTrackerPage({
                             One row per date, one column per domain that ranks
                             now or ranked at any point in the window — so a
                             site's whole run is readable left to right, and a
-                            blank cell means "checked, not in the top 100". */}
+                            blank cell means "checked, but not that far up". */}
                         <div className="mt-1">
                           <div className="mb-1 font-medium text-ink">
                             Position history
@@ -1489,7 +1571,7 @@ export default async function RankTrackerPage({
                                   </table>
                                   <p className="mt-1 text-muted">
                                     &ldquo;—&rdquo; means the check ran that day but the domain was
-                                    not in the organic top 100.
+                                    not in the organic results as far down as that check looked.
                                     {seen.size > columns.length &&
                                       ` Showing the first ${columns.length} of ${seen.size} domains that have ranked here.`}
                                   </p>
@@ -1513,7 +1595,7 @@ export default async function RankTrackerPage({
                         )}
                         <div className="mt-2">
                           <div className="mb-1 font-medium text-ink">
-                            Not in the top 100 ({notRankingCount}):
+                            Not in the top {checkDepth} ({notRankingCount}):
                           </div>
                           <div className="grid gap-x-4 gap-y-0.5 sm:grid-cols-2 lg:grid-cols-4">
                             {[...watched.keys()]
@@ -1730,10 +1812,10 @@ export default async function RankTrackerPage({
             <p className="text-xs text-muted">
               Every pattern is generated for every town in this campaign and checked FROM that town
               — “near me” style patterns too. A check costs about $
-              {COST_PER_KEYWORD.toFixed(3)} per keyword (one Google top-100 SERP), so 5 patterns ×
-              292 towns = 1,460 keywords ≈ ${(1460 * COST_PER_KEYWORD).toFixed(2)} per full run,
-              while 5 patterns × 1 town = 5 keywords is a couple of pennies. Existing keywords are
-              never duplicated.
+              {costAtDepth(depth).toFixed(4)} per keyword at this campaign&rsquo;s top-{depth}{" "}
+              depth, so 5 patterns × 292 towns = 1,460 keywords ≈ {runCost(1460, depth)} per full
+              run, while 5 patterns × 1 town = 5 keywords is a couple of pennies. Existing keywords
+              are never duplicated.
             </p>
           </form>
           <details className="mt-3 text-xs text-ink-2">
@@ -1777,6 +1859,66 @@ export default async function RankTrackerPage({
           </details>
         </Card>
       </div>
+
+      <Card className="mt-6 p-4">
+        <div className="mb-2 text-sm font-medium text-ink">
+          How deep to look
+          <span className="ml-2 text-xs font-normal text-muted">
+            currently top {depth}
+            {keywords.length > 0 && ` · ${runCost(keywords.length, depth)} per run`}
+          </span>
+        </div>
+        <form action={setCampaignDepth} className="flex flex-wrap items-center gap-2">
+          <input type="hidden" name="campaign" value={campaignId} />
+          {DEPTH_CHOICES.map((d) => (
+            <button
+              key={d}
+              name="depth"
+              value={d}
+              type="submit"
+              className={`rounded-md border px-2.5 py-1.5 text-sm ${
+                d === depth
+                  ? "border-series-1 bg-page font-medium text-series-1"
+                  : "border-edge text-ink-2 hover:text-ink"
+              }`}
+            >
+              Top {d}
+              <span className="ml-1.5 text-xs text-muted">
+                {keywords.length > 0
+                  ? runCost(keywords.length, d)
+                  : `$${costAtDepth(d).toFixed(4)}/kw`}
+              </span>
+            </button>
+          ))}
+        </form>
+        <p className="mt-2 text-xs text-muted">
+          DataForSEO charges per page of ten results it has to fetch — ${COST_PER_PAGE_LABEL} a
+          page — so this is the only setting that changes what a run costs, and it scales exactly
+          in line: top 50 is half the price of top 100, top 20 is a fifth.
+          {keywords.length > 0 && (
+            <>
+              {" "}
+              For {campaign.name}&rsquo;s {keywords.length} keywords that is{" "}
+              {runCost(keywords.length, 100)} at top 100, {runCost(keywords.length, 50)} at top 50
+              and {runCost(keywords.length, 20)} at top 20.
+            </>
+          )}
+        </p>
+        <p className="mt-1.5 text-xs text-muted">
+          <span className="font-medium text-ink">What you give up.</span> A site below the depth you
+          pick is indistinguishable from one that doesn&rsquo;t rank at all, so &ldquo;home site not
+          ranking&rdquo; comes to mean &ldquo;not in the top {depth}&rdquo;. Striking-distance work
+          lives at #11–30, so top 20 is a poor fit for a site you are actively trying to move, and a
+          reasonable one for watching a large network&rsquo;s winners.
+        </p>
+        <p className="mt-1.5 text-xs text-muted">
+          <span className="font-medium text-ink">Changing it is safe.</span> Every result records
+          the depth it was taken at, so results already collected keep their meaning. Reduce the
+          depth and sites that sat below the new limit are marked{" "}
+          <span className="font-medium text-ink">out of range</span> — a blind spot — instead of
+          being reported as having dropped out.
+        </p>
+      </Card>
 
       <details className="mt-4 text-xs text-ink-2">
         <summary className="cursor-pointer select-none text-muted hover:text-ink">
