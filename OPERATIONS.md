@@ -113,6 +113,7 @@ Applied migrations, in order:
 | `20260802000012_rank_tracker_campaigns.sql` | `campaign_id` required on both tracked tables; existing data backfilled into one campaign per org; uniqueness moved under the campaign |
 | `20260802000013_keyword_location_validation.sql` | `tracked_keywords.location_valid` |
 | `20260802000014_serp_depth.sql` | `campaigns.serp_depth` (how deep checks look), `serp_checks.depth` + `serp_task_queue.depth` (depth each result/task was taken at) |
+| `20260802000015_serp_priority.sql` | `campaigns.serp_priority` (DataForSEO queue: 1 standard, 2 high-priority at 2× cost) |
 
 **When adding a migration:** write a new timestamped `.sql` file, validate it
 (there is a PGlite validator harness used during development — apply all
@@ -268,6 +269,12 @@ pause the project.
   Every stored result records the depth it was taken at; reducing the depth
   marks sites below the new limit "out of range" instead of reporting them
   as dropped.
+- **Queue choice.** Standard (default) and high-priority are separate
+  DataForSEO crawler pools; high-priority costs exactly double and returns in
+  under a minute. They fail independently — on 2026-08-06 the standard pool
+  sat on tasks for hours while a high-priority probe finished in 40s. The
+  "Queue" toggle in the campaign's "How deep to look" card switches pools;
+  switch back to standard once their queue recovers.
 - **Timing.** Tasks are posted in seconds and normally come back within a
   couple of minutes, worst case ~20. The page shows how many are still in
   flight and how long the oldest has been out there; past **60 minutes** it

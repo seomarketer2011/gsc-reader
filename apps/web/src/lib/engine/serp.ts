@@ -28,9 +28,21 @@ export const DEFAULT_DEPTH = 100;
 export const DEPTH_CHOICES = [100, 50, 30, 20, 10] as const;
 /** Dollars per keyword at a given depth: $0.0006 per page of ten. */
 export const COST_PER_PAGE = 0.0006;
-export const costAtDepth = (depth: number) => (depth / 10) * COST_PER_PAGE;
+export const costAtDepth = (depth: number, priority: number = DEFAULT_PRIORITY) =>
+  (depth / 10) * COST_PER_PAGE * (priority === 2 ? 2 : 1);
 export const normaliseDepth = (depth: number | null | undefined): number =>
   depth && (DEPTH_CHOICES as readonly number[]).includes(depth) ? depth : DEFAULT_DEPTH;
+
+/**
+ * Which DataForSEO queue to post through. Standard (1) and high (2) are
+ * separate crawler pools; high costs exactly double and typically returns in
+ * under a minute. They fail independently — the standard pool has been seen
+ * sitting on tasks for hours while high-priority probes completed in seconds
+ * — which is the whole reason this is a setting rather than a constant.
+ */
+export const DEFAULT_PRIORITY = 1;
+export const normalisePriority = (priority: number | null | undefined): number =>
+  priority === 2 ? 2 : 1;
 
 export interface WatchedDomain {
   domain: string; // normalised: lowercase, no protocol/www/path
@@ -326,6 +338,7 @@ export async function postSerpTasks(
   orgId: string,
   keywords: TrackedKeyword[],
   depth: number = DEFAULT_DEPTH,
+  priority: number = DEFAULT_PRIORITY,
 ): Promise<number> {
   let posted = 0;
   for (let i = 0; i < keywords.length; i += TASK_POST_BATCH) {
@@ -339,7 +352,7 @@ export async function postSerpTasks(
           location_name: k.location_name,
           language_name: "English",
           depth,
-          priority: 1,
+          priority,
           tag: k.id,
         })),
       ),

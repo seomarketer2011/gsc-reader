@@ -4,6 +4,7 @@ import {
   dataForSeoConfigured,
   getWatchedDomains,
   normaliseDepth,
+  normalisePriority,
   postSerpTasks,
 } from "@/lib/engine/serp";
 import { getServerClient, getServiceClient } from "@/lib/supabase/server";
@@ -49,13 +50,15 @@ export async function POST(request: Request) {
   if (!campaignId) return NextResponse.json({ error: "campaign required" }, { status: 400 });
   const { data: campaign } = await supabase!
     .from("campaigns")
-    .select("id, organisation_id, serp_depth")
+    .select("id, organisation_id, serp_depth, serp_priority")
     .eq("id", campaignId)
     .maybeSingle();
   if (!campaign) return NextResponse.json({ error: "campaign not found" }, { status: 404 });
   const orgId = campaign.organisation_id as string;
-  // How deep this campaign looks, and therefore what the run costs.
+  // How deep this campaign looks and which queue it uses — together, what
+  // the run costs.
   const depth = normaliseDepth(campaign.serp_depth as number | null);
+  const priority = normalisePriority(campaign.serp_priority as number | null);
 
   const service = getServiceClient();
   if (!service) return NextResponse.json({ error: "service key missing" }, { status: 500 });
@@ -105,7 +108,7 @@ export async function POST(request: Request) {
     ...queuedToday.map((q) => q.keyword_id),
   ]);
   const toPost = keywords.filter((k) => !excluded.has(k.id));
-  const posted = toPost.length > 0 ? await postSerpTasks(service, orgId, toPost, depth) : 0;
+  const posted = toPost.length > 0 ? await postSerpTasks(service, orgId, toPost, depth, priority) : 0;
 
   const mine = new Set(keywords.map((k) => k.id));
   const watched = await getWatchedDomains(service, orgId);

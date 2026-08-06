@@ -10,6 +10,7 @@ import {
   COST_PER_PAGE,
   DEFAULT_DEPTH,
   DEPTH_CHOICES,
+  normalisePriority,
   fetchUkLocations,
   normaliseDepth,
   normaliseDomain,
@@ -38,9 +39,9 @@ const HISTORY_DAYS = 30;
 // The expanded card shows one keyword's full run of checks, which is a single
 // cheap query — so it reaches back further than the summary does.
 const KEYWORD_HISTORY_DAYS = 180;
-/** "$2.86" for a run of this many keywords at this depth. */
-const runCost = (keywords: number, depth: number) =>
-  `$${(keywords * costAtDepth(depth)).toFixed(2)}`;
+/** "$2.86" for a run of this many keywords at this depth and priority. */
+const runCost = (keywords: number, depth: number, priority = 1) =>
+  `$${(keywords * costAtDepth(depth, priority)).toFixed(2)}`;
 const COST_PER_PAGE_LABEL = COST_PER_PAGE.toFixed(4);
 // Cards rendered per page-load; more via the "Show more" link. Kept modest
 // because every card is real DOM — hundreds froze the browser.
@@ -153,6 +154,18 @@ async function setCampaignDepth(formData: FormData) {
   if (!c) return;
   const depth = normaliseDepth(Number(formData.get("depth")));
   await c.supabase.from("campaigns").update({ serp_depth: depth }).eq("id", c.campaignId);
+  revalidatePath("/rank-tracker");
+}
+
+/** Standard queue (1) or high-priority queue (2, exactly double the cost).
+ * Separate DataForSEO crawler pools that fail independently — the escape
+ * hatch for the nights the standard pool sits on tasks for hours. */
+async function setCampaignPriority(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const priority = normalisePriority(Number(formData.get("priority")));
+  await c.supabase.from("campaigns").update({ serp_priority: priority }).eq("id", c.campaignId);
   revalidatePath("/rank-tracker");
 }
 
@@ -628,12 +641,13 @@ export default async function RankTrackerPage({
   // the note on callerCampaign.)
   const { data: campaignRows } = await c.supabase
     .from("campaigns")
-    .select("id, name, serp_depth, organisation_id")
+    .select("id, name, serp_depth, serp_priority, organisation_id")
     .order("name");
   const campaigns = (campaignRows ?? []) as {
     id: string;
     name: string;
     serp_depth: number | null;
+    serp_priority: number | null;
     organisation_id: string;
   }[];
   const requested = typeof params.campaign === "string" ? params.campaign : "";
@@ -680,6 +694,7 @@ export default async function RankTrackerPage({
   // What the NEXT check will look at. Results already stored keep whatever
   // depth they were taken at.
   const depth = normaliseDepth(campaign.serp_depth);
+  const priority = normalisePriority(campaign.serp_priority);
 
   // One clock reading for the whole render, so the cutoffs, "today" and the
   // in-flight age all agree with each other.
@@ -1091,7 +1106,7 @@ export default async function RankTrackerPage({
           <RankCheckButton
             keywordCount={keywords.length}
             campaignId={campaignId}
-            estimatedCost={keywords.length ? runCost(keywords.length, depth) : ""}
+            estimatedCost={keywords.length ? runCost(keywords.length, depth, priority) : ""}
             depth={depth}
           />
         </span>
@@ -1823,10 +1838,10 @@ export default async function RankTrackerPage({
             <p className="text-xs text-muted">
               Every pattern is generated for every town in this campaign and checked FROM that town
               — “near me” style patterns too. A check costs about $
-              {costAtDepth(depth).toFixed(4)} per keyword at this campaign&rsquo;s top-{depth}{" "}
-              depth, so 5 patterns × 292 towns = 1,460 keywords ≈ {runCost(1460, depth)} per full
-              run, while 5 patterns × 1 town = 5 keywords is a couple of pennies. Existing keywords
-              are never duplicated.
+              {costAtDepth(depth, priority).toFixed(4)} per keyword at this campaign&rsquo;s
+              top-{depth} depth, so 5 patterns × 292 towns = 1,460 keywords ≈{" "}
+              {runCost(1460, depth, priority)} per full run, while 5 patterns × 1 town = 5 keywords
+              is a couple of pennies. Existing keywords are never duplicated.
             </p>
           </form>
           <details className="mt-3 text-xs text-ink-2">
@@ -1876,7 +1891,8 @@ export default async function RankTrackerPage({
           How deep to look
           <span className="ml-2 text-xs font-normal text-muted">
             currently top {depth}
-            {keywords.length > 0 && ` · ${runCost(keywords.length, depth)} per run`}
+            {priority === 2 && " · high-priority queue (2× cost)"}
+            {keywords.length > 0 && ` · ${runCost(keywords.length, depth, priority)} per run`}
           </span>
         </div>
         <form action={setCampaignDepth} className="flex flex-wrap items-center gap-2">
@@ -1896,8 +1912,8 @@ export default async function RankTrackerPage({
               Top {d}
               <span className="ml-1.5 text-xs text-muted">
                 {keywords.length > 0
-                  ? runCost(keywords.length, d)
-                  : `$${costAtDepth(d).toFixed(4)}/kw`}
+                  ? runCost(keywords.length, d, priority)
+                  : `$${costAtDepth(d, priority).toFixed(4)}/kw`}
               </span>
             </button>
           ))}
@@ -1910,11 +1926,42 @@ export default async function RankTrackerPage({
             <>
               {" "}
               For {campaign.name}&rsquo;s {keywords.length} keywords that is{" "}
-              {runCost(keywords.length, 100)} at top 100, {runCost(keywords.length, 50)} at top 50
-              and {runCost(keywords.length, 20)} at top 20.
+              {runCost(keywords.length, 100, priority)} at top 100,{" "}
+              {runCost(keywords.length, 50, priority)} at top 50 and{" "}
+              {runCost(keywords.length, 20, priority)} at top 20.
             </>
           )}
         </p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted">Queue</span>
+          <form action={setCampaignPriority} className="flex items-center gap-2">
+            <input type="hidden" name="campaign" value={campaignId} />
+            {[
+              { value: 1, label: "Standard", note: "cheapest · usually minutes" },
+              { value: 2, label: "High priority", note: "2× cost · under a minute" },
+            ].map((opt) => (
+              <button
+                key={opt.value}
+                name="priority"
+                value={opt.value}
+                type="submit"
+                className={`rounded-md border px-2.5 py-1.5 text-sm ${
+                  opt.value === priority
+                    ? "border-series-1 bg-page font-medium text-series-1"
+                    : "border-edge text-ink-2 hover:text-ink"
+                }`}
+              >
+                {opt.label}
+                <span className="ml-1.5 text-xs text-muted">{opt.note}</span>
+              </button>
+            ))}
+          </form>
+          <span className="text-xs text-muted">
+            Standard and high priority are separate DataForSEO crawler pools that fail
+            independently — switch to high priority when a standard run sits for hours with
+            nothing back, and switch back once their standard queue recovers.
+          </span>
+        </div>
         <p className="mt-1.5 text-xs text-muted">
           <span className="font-medium text-ink">What you give up.</span> A site below the depth you
           pick is indistinguishable from one that doesn&rsquo;t rank at all, so &ldquo;home site not
