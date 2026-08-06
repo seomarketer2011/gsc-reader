@@ -103,6 +103,22 @@ export async function GET(request: NextRequest) {
   ]);
 
   const keywordIds = new Set(keywords.map((k) => k.id));
+  // Cached UK-wide search volumes; reading the cache is free and gaps simply
+  // export as blank.
+  const volumes = new Map<string, number | null>();
+  {
+    const names = [...new Set(keywords.map((k) => k.keyword))];
+    for (let i = 0; i < names.length; i += 200) {
+      const { data } = await supabase!
+        .from("keyword_volumes")
+        .select("keyword, search_volume")
+        .eq("organisation_id", orgId)
+        .in("keyword", names.slice(i, i + 200));
+      for (const row of data ?? []) {
+        volumes.set(row.keyword as string, (row.search_volume as number) ?? null);
+      }
+    }
+  }
   const mineChecks = checks.filter((row) => keywordIds.has(row.keyword_id));
   const latest = new Map<string, { date: string; error: string | null }>();
   for (const row of mineChecks) {
@@ -243,10 +259,10 @@ export async function GET(request: NextRequest) {
   // — a first check, or a domain that wasn't there last time. That is not the
   // same as a zero, so it is left empty rather than filled in.
   const lines = [
-    "keyword,location,checked,previous_check,status,domain,domain_home_town,is_home,position,previous_position,change,url",
+    "keyword,location,monthly_search_volume,checked,previous_check,status,domain,domain_home_town,is_home,position,previous_position,change,url",
   ];
   for (const { k, check, ranked, lost, homeSet, comparedWith } of filtered) {
-    const head = [esc(k.keyword), esc(k.location_name)];
+    const head = [esc(k.keyword), esc(k.location_name), volumes.get(k.keyword) ?? ""];
     if (!check) {
       lines.push([...head, "", "", "unchecked", "", "", "", "", "", "", ""].join(","));
       continue;

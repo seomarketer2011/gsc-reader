@@ -27,6 +27,7 @@ import {
   series,
   successfulCheckDates,
 } from "@/lib/engine/rank-history";
+import { getVolumes } from "@/lib/engine/volumes";
 import { SupabaseClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
@@ -451,6 +452,30 @@ async function revalidateLocations(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/**
+ * Fills the volume cache for every keyword in the campaign that doesn't have
+ * a fresh entry. One Google Ads lookup covers up to 700 keywords, so this is
+ * pennies even for a big campaign, and the 30-day cache means pressing it
+ * again is free until the numbers are stale. Volumes are UK-wide per keyword
+ * text — Google Ads has no postcode-level volume, so "locksmith bickley"
+ * gets the national count of people searching exactly that.
+ */
+async function fetchSearchVolumes(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const rows = await fetchAllRows<{ keyword: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("keyword")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  await getVolumes(c.supabase, c.orgId, rows.map((r) => r.keyword));
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteKeyword(formData: FormData) {
   "use server";
   const c = await caller();
@@ -615,6 +640,7 @@ export default async function RankTrackerPage({
   const sort = typeof params.sort === "string" ? params.sort : "az";
   const limit = Math.min(Math.max(Number(params.limit) || DISPLAY_STEP, DISPLAY_STEP), 1000);
   const openId = typeof params.open === "string" ? params.open : "";
+  const siteParam = typeof params.site === "string" ? normaliseDomain(params.site) : "";
 
   const c = await caller();
   if (!c) {
@@ -728,6 +754,25 @@ export default async function RankTrackerPage({
     c.supabase.from("sites").select("id, domain").eq("organisation_id", orgId),
   ]);
   const keywordIds = new Set(keywords.map((k) => k.id));
+
+  // Cached search volumes (UK-wide, per keyword text) — reading the cache is
+  // free; the button below fills gaps. null = looked up, Google Ads had no
+  // number for it; absent = never looked up.
+  const volumes = new Map<string, number | null>();
+  {
+    const names = [...new Set(keywords.map((k) => k.keyword))];
+    for (let i = 0; i < names.length; i += 200) {
+      const { data } = await c.supabase
+        .from("keyword_volumes")
+        .select("keyword, search_volume")
+        .eq("organisation_id", orgId)
+        .in("keyword", names.slice(i, i + 200));
+      for (const row of data ?? []) {
+        volumes.set(row.keyword as string, (row.search_volume as number) ?? null);
+      }
+    }
+  }
+  const volumesMissing = keywords.filter((k) => !volumes.has(k.keyword)).length;
 
   // Watched universe: exactly this campaign's domains. gsc marks the ones
   // that are also GSC-connected sites. homeKey matches a domain to the
@@ -1007,6 +1052,9 @@ export default async function RankTrackerPage({
     visible.sort(
       (a, b) => b.ranked.length - a.ranked.length || a.k.keyword.localeCompare(b.k.keyword),
     );
+  } else if (sort === "volume") {
+    const vol = (s: (typeof summarised)[number]) => volumes.get(s.k.keyword) ?? -1;
+    visible.sort((a, b) => vol(b) - vol(a) || a.k.keyword.localeCompare(b.k.keyword));
   } else if (sort === "moved" || sort === "dropped") {
     // "Biggest move" reads the home site's change; a drop out of the top 100
     // has no number, so it is ranked as the worst possible fall. "dropped"
@@ -1055,6 +1103,7 @@ export default async function RankTrackerPage({
       ...(q ? { q } : {}),
       ...(view !== "all" ? { view } : {}),
       ...(sort !== "az" ? { sort } : {}),
+      ...(siteParam ? { site: siteParam } : {}),
       ...overrides,
     };
     for (const key of Object.keys(merged)) if (!merged[key]) delete merged[key];
@@ -1348,7 +1397,19 @@ export default async function RankTrackerPage({
               {sortLink("sites", "Sites ranking")}
               {sortLink("moved", "Biggest move")}
               {sortLink("dropped", "Worst move")}
+              {sortLink("volume", "Volume")}
             </span>
+            {volumesMissing > 0 && (
+              <form action={fetchSearchVolumes}>
+                <input type="hidden" name="campaign" value={campaignId} />
+                <PendingButton
+                  pendingLabel="Fetching volumes…"
+                  className="rounded-md border border-edge px-2 py-1 text-xs font-medium text-series-1 hover:bg-page"
+                >
+                  Get search volumes ({volumesMissing} missing · ~$0.05 per 1,000)
+                </PendingButton>
+              </form>
+            )}
             {movedRows > 0 && (
               <span className="text-xs text-muted">
                 {movedRows} {movedRows === 1 ? "keyword" : "keywords"} changed since the previous
@@ -1356,6 +1417,104 @@ export default async function RankTrackerPage({
               </span>
             )}
           </div>
+
+          {siteParam && watched.has(siteParam) && (() => {
+            // Site-centric flip of the same data: every keyword this one
+            // domain ranks for (or just dropped out of), one row each. Built
+            // from the movements already computed per keyword, so it shows
+            // exactly what the cards below show — just pivoted.
+            const rows = summarised
+              .flatMap((s) => {
+                const m = s.movements.find((m) => m.domain === siteParam);
+                return m && (m.position !== null || m.state === "lost")
+                  ? [{ s, m }]
+                  : [];
+              })
+              .sort(
+                (a, b) =>
+                  (a.m.position ?? 999) - (b.m.position ?? 999) ||
+                  a.s.k.keyword.localeCompare(b.s.k.keyword),
+              );
+            const info = watched.get(siteParam);
+            const top10 = rows.filter(({ m }) => m.position !== null && m.position <= 10).length;
+            return (
+              <Card className="mb-4 border-series-1/40 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-medium text-ink">
+                    {siteParam}
+                    {info?.homeLabel && (
+                      <span className="ml-2 text-xs font-normal text-muted">
+                        home town {info.homeLabel}
+                      </span>
+                    )}
+                    <span className="ml-2 text-xs font-normal text-muted">
+                      ranks for {rows.filter(({ m }) => m.position !== null).length} of{" "}
+                      {keywords.length} keywords · {top10} in the top 10
+                    </span>
+                  </div>
+                  <Link
+                    href={linkParams({ site: "" })}
+                    className="rounded-md border border-edge px-2 py-1 text-xs font-medium text-ink-2 hover:text-ink"
+                  >
+                    Close site view ✕
+                  </Link>
+                </div>
+                {rows.length === 0 ? (
+                  <p className="mt-2 text-xs text-muted">
+                    Not ranking for any checked keyword in this campaign yet.
+                  </p>
+                ) : (
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="min-w-full text-xs">
+                      <thead>
+                        <tr className="text-left text-muted">
+                          <th className="py-1 pr-4 font-medium">Keyword</th>
+                          <th className="py-1 pr-4 text-right font-medium">Volume</th>
+                          <th className="py-1 pr-4 text-right font-medium">Position</th>
+                          <th className="py-1 pr-4 font-medium">Since last check</th>
+                          <th className="py-1 font-medium">Checked</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows.map(({ s, m }) => (
+                          <tr key={s.k.id} className="border-t border-edge">
+                            <td className="py-1 pr-4">
+                              <Link
+                                href={`${linkParams({ open: s.k.id })}#kw-${s.k.id}`}
+                                className="font-medium text-ink hover:text-series-1 hover:underline"
+                              >
+                                {s.k.keyword}
+                              </Link>
+                              <span className="ml-1.5 text-muted">
+                                {s.k.location_name.split(",")[0]}
+                              </span>
+                            </td>
+                            <td className="tnum py-1 pr-4 text-right text-ink-2">
+                              {(() => {
+                                const v = volumes.get(s.k.keyword);
+                                return v === undefined ? "—" : v === null ? "n/a" : `~${v.toLocaleString("en-GB")}`;
+                              })()}
+                            </td>
+                            <td className="tnum py-1 pr-4 text-right">
+                              {m.position === null ? (
+                                <span className="text-critical">out</span>
+                              ) : (
+                                <Badge tone={positionTone(m.position)}>#{m.position}</Badge>
+                              )}
+                            </td>
+                            <td className="py-1 pr-4">
+                              <MovementMark m={m} verbose />
+                            </td>
+                            <td className="py-1 text-muted">{s.check?.date ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </Card>
+            );
+          })()}
 
           <div className="space-y-3">
             {visible
@@ -1378,6 +1537,18 @@ export default async function RankTrackerPage({
                         from {k.location_name}
                         {k.location_valid === false && " ⚠ not a DataForSEO location"}
                       </span>
+                      {(() => {
+                        const v = volumes.get(k.keyword);
+                        if (v === undefined) return null;
+                        return (
+                          <span
+                            className="tnum ml-2 text-xs text-muted"
+                            title="UK-wide monthly Google searches for this exact phrase (Google Ads data — no postcode-level volumes exist)"
+                          >
+                            {v === null ? "· no volume data" : `· ~${v.toLocaleString("en-GB")}/mo`}
+                          </span>
+                        );
+                      })()}
                     </div>
                     <div className="flex items-center gap-3 text-xs text-ink-2">
                       {check ? (
@@ -1437,7 +1608,13 @@ export default async function RankTrackerPage({
                         >
                           <Badge tone={positionTone(r.position!)}>#{r.position}</Badge>
                           <MovementMark m={r} verbose />
-                          <span className="text-ink-2">{r.domain}</span>
+                          <Link
+                            href={linkParams({ site: r.domain })}
+                            className="text-ink-2 hover:text-series-1 hover:underline"
+                            title={`${r.url ? `${r.url} — ` : ""}see every keyword ${r.domain} ranks for`}
+                          >
+                            {r.domain}
+                          </Link>
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
                           {!isHome(r.domain) && watched.get(r.domain)?.homeLabel && (
                             <span className="text-muted">
@@ -1761,7 +1938,13 @@ export default async function RankTrackerPage({
                 {watchDomains.map((w) => (
                   <form key={w.id} action={deleteDomain} className="flex items-center justify-between gap-2">
                     <span className="truncate">
-                      {w.domain}
+                      <Link
+                        href={linkParams({ site: normaliseDomain(w.domain) })}
+                        className="hover:text-series-1 hover:underline"
+                        title={`See every keyword ${w.domain} ranks for`}
+                      >
+                        {w.domain}
+                      </Link>
                       {(() => {
                         // serp_location holds the canonical DataForSEO name;
                         // only its first segment is worth showing, and only
