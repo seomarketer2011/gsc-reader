@@ -521,6 +521,10 @@ async function retryFailedChecks(formData: FormData) {
       );
   }
   revalidatePath("/rank-tracker");
+  // Back to the All view: the button usually lives on the "Failed checks"
+  // view, which is empty the instant the retry succeeds — leaving someone
+  // staring at zero keywords as if the run's results had been wiped.
+  redirect(`/rank-tracker?campaign=${c.campaignId}`);
 }
 
 /**
