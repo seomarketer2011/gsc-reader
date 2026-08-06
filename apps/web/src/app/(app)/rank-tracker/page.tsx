@@ -2037,7 +2037,7 @@ export default async function RankTrackerPage({
           </form>
           <details className="mt-3 text-xs text-ink-2">
             <summary className="cursor-pointer select-none text-muted hover:text-ink">
-              Add one-off keywords manually / clear all
+              Add one-off keywords manually
             </summary>
             <form action={addKeywords} className="mt-2 space-y-2">
               <input type="hidden" name="campaign" value={campaignId} />
@@ -2066,16 +2066,6 @@ export default async function RankTrackerPage({
                 it. A postcode district (BR1) or a borough name works; anything unrecognised is
                 flagged above rather than checked.
               </p>
-            </form>
-            <form action={deleteAllKeywords} className="mt-2">
-              <input type="hidden" name="campaign" value={campaignId} />
-              <PendingButton
-                pendingLabel="Deleting…"
-                className="text-critical hover:underline"
-                confirmMessage={`Delete all ${keywords.length} keywords in ${campaign.name}? Every position ever recorded for them is deleted with them, including checks you have already paid for. This cannot be undone.`}
-              >
-                Delete every keyword in {campaign.name} (its ranking history goes with them)
-              </PendingButton>
             </form>
           </details>
         </Card>
@@ -2192,6 +2182,16 @@ export default async function RankTrackerPage({
               Rename
             </PendingButton>
           </form>
+            <form action={deleteAllKeywords} >
+              <input type="hidden" name="campaign" value={campaignId} />
+              <PendingButton
+                pendingLabel="Deleting…"
+                className="text-critical hover:underline"
+                confirmMessage={`Delete all ${keywords.length} keywords in ${campaign.name}? Every position ever recorded for them is deleted with them, including checks you have already paid for. This cannot be undone.`}
+              >
+                Delete every keyword in {campaign.name} (its ranking history goes with them)
+              </PendingButton>
+            </form>
           <form action={deleteCampaign}>
             <input type="hidden" name="campaign" value={campaignId} />
             <PendingButton
