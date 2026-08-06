@@ -1225,6 +1225,7 @@ export default async function RankTrackerPage({
                   <PendingButton
                     pendingLabel="Clearing…"
                     className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                    confirmMessage={`Forget ${inFlight} in-flight tasks? Results they have already produced stay; this only stops waiting on them so a fresh check can start.`}
                   >
                     Forget {inFlight} in-flight {inFlight === 1 ? "task" : "tasks"} (then press
                     Check rankings now)
@@ -2068,7 +2069,11 @@ export default async function RankTrackerPage({
             </form>
             <form action={deleteAllKeywords} className="mt-2">
               <input type="hidden" name="campaign" value={campaignId} />
-              <PendingButton pendingLabel="Deleting…" className="text-critical hover:underline">
+              <PendingButton
+                pendingLabel="Deleting…"
+                className="text-critical hover:underline"
+                confirmMessage={`Delete all ${keywords.length} keywords in ${campaign.name}? Every position ever recorded for them is deleted with them, including checks you have already paid for. This cannot be undone.`}
+              >
                 Delete every keyword in {campaign.name} (its ranking history goes with them)
               </PendingButton>
             </form>
@@ -2189,7 +2194,11 @@ export default async function RankTrackerPage({
           </form>
           <form action={deleteCampaign}>
             <input type="hidden" name="campaign" value={campaignId} />
-            <PendingButton pendingLabel="Deleting…" className="text-critical hover:underline">
+            <PendingButton
+              pendingLabel="Deleting…"
+              className="text-critical hover:underline"
+              confirmMessage={`Delete the campaign ${campaign.name} with its ${watchDomains.length} domains, ${keywords.length} keywords and all recorded positions? This cannot be undone.`}
+            >
               Delete this campaign — {watchDomains.length} domains, {keywords.length} keywords and
               all of their ranking history
             </PendingButton>
