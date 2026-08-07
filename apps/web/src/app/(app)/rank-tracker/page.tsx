@@ -567,6 +567,17 @@ async function deleteDomain(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/** "/emergency-locksmith" from a full URL — the part that says WHICH page
+ * ranks. Falls back to "/" (homepage) and to the raw string on bad input. */
+function pathOf(url: string): string {
+  try {
+    const u = new URL(url);
+    return (u.pathname === "/" ? "/" : u.pathname.replace(/\/$/, "")) + u.search;
+  } catch {
+    return url || "/";
+  }
+}
+
 function positionTone(position: number): "good" | "blue" | "neutral" {
   if (position <= 3) return "good";
   if (position <= 10) return "blue";
@@ -1476,6 +1487,7 @@ export default async function RankTrackerPage({
                           <th className="py-1 pr-4 font-medium">Keyword</th>
                           <th className="py-1 pr-4 text-right font-medium">Volume</th>
                           <th className="py-1 pr-4 text-right font-medium">Position</th>
+                          <th className="py-1 pr-4 font-medium">Ranking page</th>
                           <th className="py-1 pr-4 font-medium">Since last check</th>
                           <th className="py-1 font-medium">Checked</th>
                         </tr>
@@ -1505,6 +1517,21 @@ export default async function RankTrackerPage({
                                 <span className="text-critical">out</span>
                               ) : (
                                 <Badge tone={positionTone(m.position)}>#{m.position}</Badge>
+                              )}
+                            </td>
+                            <td className="max-w-56 truncate py-1 pr-4">
+                              {m.url ? (
+                                <a
+                                  href={m.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={m.url}
+                                  className="text-ink-2 hover:text-series-1 hover:underline"
+                                >
+                                  {pathOf(m.url)}
+                                </a>
+                              ) : (
+                                <span className="text-muted">—</span>
                               )}
                             </td>
                             <td className="py-1 pr-4">
@@ -1620,6 +1647,17 @@ export default async function RankTrackerPage({
                           >
                             {r.domain}
                           </Link>
+                          {isOpen && r.url && (
+                            <a
+                              href={r.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title={r.url}
+                              className="max-w-40 truncate text-muted hover:text-series-1 hover:underline"
+                            >
+                              {pathOf(r.url)}
+                            </a>
+                          )}
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
                           {!isHome(r.domain) && watched.get(r.domain)?.homeLabel && (
                             <span className="text-muted">
@@ -1796,9 +1834,16 @@ export default async function RankTrackerPage({
                             {check.top.map((t) => (
                               <li key={t.position} className="truncate">
                                 <span className="tnum font-medium text-ink">#{t.position}</span>{" "}
-                                <span className={watched.has(t.domain) ? "font-semibold text-series-1" : ""}>
+                                <a
+                                  href={t.url || undefined}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={t.url}
+                                  className={`hover:underline ${watched.has(t.domain) ? "font-semibold text-series-1" : ""}`}
+                                >
                                   {t.domain}
-                                </span>{" "}
+                                  {t.url && <span className="font-normal text-muted">{pathOf(t.url)}</span>}
+                                </a>{" "}
                                 <span className="text-muted">— {t.title}</span>
                               </li>
                             ))}
