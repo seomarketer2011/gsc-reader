@@ -114,6 +114,7 @@ export async function POST(request: Request) {
   // check_date) uniqueness makes claiming atomic: ignoreDuplicates hands
   // each keyword to exactly one caller, and only the winner posts it.
   let posted = 0;
+  let postError: string | null = null;
   if (toPost.length > 0) {
     const { data: claimedRows } = await service
       .from("serp_task_queue")
@@ -132,6 +133,15 @@ export async function POST(request: Request) {
     if (mineToPost.length > 0) {
       try {
         posted = await postSerpTasks(service, orgId, mineToPost, depth, priority);
+      } catch (e) {
+        // A thrown post is an account-level failure — no funds, bad auth, or
+        // a DataForSEO outage. Turn it into a readable answer instead of a
+        // bare 500 with an empty body; the finally below releases the
+        // claims, so nothing stays blocked for the retry.
+        const message = e instanceof Error ? e.message : "task posting failed";
+        postError = message.includes("402")
+          ? "DataForSEO account is out of funds — top up the balance at app.dataforseo.com, then press Check rankings now again."
+          : `DataForSEO task posting failed: ${message.slice(0, 200)}`;
       } finally {
         // Release claims that never became real tasks (post failed or was
         // rejected), so those keywords aren't blocked until expiry. Scoped
@@ -149,6 +159,8 @@ export async function POST(request: Request) {
       }
     }
   }
+
+  if (postError) return NextResponse.json({ error: postError }, { status: 502 });
 
   const mine = new Set(keywords.map((k) => k.id));
   const watched = await getWatchedDomains(service, orgId);

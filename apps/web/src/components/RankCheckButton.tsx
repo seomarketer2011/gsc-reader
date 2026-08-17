@@ -53,7 +53,19 @@ export function RankCheckButton({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ campaignId }),
         });
-        const data = await res.json();
+        // A crashed or resource-killed request can return an empty body;
+        // parse defensively so the message is "server error", never
+        // "Unexpected end of JSON input".
+        let data: { done?: boolean; total?: number; checked?: number; processing?: number; posted?: number; error?: string } = {};
+        try {
+          data = await res.json();
+        } catch {
+          throw new Error(
+            res.ok
+              ? "The server returned an empty response — refresh the page and try again."
+              : `Server error (HTTP ${res.status}) — refresh the page and try again.`,
+          );
+        }
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
         if (data.done) {
           setState("done");
@@ -62,7 +74,7 @@ export function RankCheckButton({
           return;
         }
         const elapsed = Math.floor((Date.now() - startedAt) / 60000);
-        if (!announcedQueue && data.posted > 0) {
+        if (!announcedQueue && (data.posted ?? 0) > 0) {
           announcedQueue = true;
           setMessage(
             `${data.posted} keywords queued at DataForSEO — results usually land within 20 minutes.`,
