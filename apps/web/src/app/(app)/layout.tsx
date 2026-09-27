@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import { GlobalBar } from "@/components/GlobalBar";
+import { MobileNav } from "@/components/MobileNav";
 import { SideNav } from "@/components/SideNav";
 import { AppStateProvider } from "@/components/AppStateProvider";
 import { AuthWatcher } from "@/components/AuthWatcher";
@@ -84,6 +85,9 @@ export default async function AppLayout({
           </div>
         </aside>
         <div className="flex min-w-0 flex-1 flex-col">
+          <Suspense>
+            <MobileNav orgName={organisation.name} />
+          </Suspense>
           <Suspense>
             <GlobalBar network={network} campaigns={campaigns} sites={sites} />
           </Suspense>
