@@ -454,6 +454,19 @@ function positionTone(position: number): "good" | "blue" | "neutral" {
   return "neutral";
 }
 
+/** The path of the page that ranks ("/door-repairs"), "" when it is the
+ * homepage — rankings are recorded per DOMAIN (best page wins), so this is
+ * what tells the reader WHICH page did it. */
+function urlPath(u: string): string {
+  try {
+    const { pathname, search } = new URL(u);
+    const path = `${pathname}${search}`;
+    return path === "/" ? "" : path;
+  } catch {
+    return "";
+  }
+}
+
 export default async function RankTrackerPage({
   searchParams,
 }: {
@@ -1067,7 +1080,9 @@ export default async function RankTrackerPage({
 
                   {ranked.length > 0 && (
                     <div className="mt-2.5 flex flex-wrap gap-1.5">
-                      {(isOpen ? ranked : ranked.slice(0, 20)).map((r) => (
+                      {(isOpen ? ranked : ranked.slice(0, 20)).map((r) => {
+                        const path = urlPath(r.url);
+                        return (
                         <span
                           key={r.domain}
                           title={r.url}
@@ -1091,6 +1106,9 @@ export default async function RankTrackerPage({
                             return null;
                           })()}
                           <span className="text-ink-2">{r.domain}</span>
+                          {path && (
+                            <span className="max-w-[12rem] truncate text-muted">{path}</span>
+                          )}
                           {isHome(r.domain) && <span className="font-medium text-series-1">home</span>}
                           {!isHome(r.domain) && watched.get(r.domain)?.homeLabel && (
                             <span className="text-muted">
@@ -1098,7 +1116,8 @@ export default async function RankTrackerPage({
                             </span>
                           )}
                         </span>
-                      ))}
+                        );
+                      })}
                       {!isOpen && ranked.length > 20 && (
                         <span className="self-center text-xs text-muted">
                           +{ranked.length - 20} more in details ↓
@@ -1124,7 +1143,10 @@ export default async function RankTrackerPage({
                                 <span className="tnum font-medium text-ink">#{t.position}</span>{" "}
                                 <span className={watched.has(t.domain) ? "font-semibold text-series-1" : ""}>
                                   {t.domain}
-                                </span>{" "}
+                                </span>
+                                {urlPath(t.url) && (
+                                  <span className="text-muted">{urlPath(t.url)}</span>
+                                )}{" "}
                                 <span className="text-muted">— {t.title}</span>
                               </li>
                             ))}
