@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerClient } from "@/lib/supabase/server";
-import { normaliseDomain, TopResult } from "@/lib/engine/serp";
+import { normaliseDomain } from "@/lib/engine/serp";
 
 // CSV of the latest check per keyword in ONE campaign (?campaign=): one row
 // per ranked watched domain, plus a row for any home-town domain that is NOT
@@ -70,10 +70,6 @@ export async function GET(request: NextRequest) {
   const campaignId = campaign.id;
   orgId = campaign.organisation_id;
 
-  const cutoffDate = new Date();
-  cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
-  const cutoff = cutoffDate.toISOString().slice(0, 10);
-
   const [keywords, domains, checks] = await Promise.all([
     all<{ id: string; keyword: string; location_name: string }>((f, t) =>
       supabase!.from("tracked_keywords").select("id, keyword, location_name").eq("campaign_id", campaignId).order("keyword").range(f, t),
@@ -81,13 +77,16 @@ export async function GET(request: NextRequest) {
     all<{ domain: string; location: string | null; serp_location: string | null }>((f, t) =>
       supabase!.from("tracked_domains").select("domain, location, serp_location").eq("campaign_id", campaignId).order("domain").range(f, t),
     ),
-    all<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>((f, t) =>
+    // No date bound: the export mirrors the dashboard, whose latest run must
+    // show however long ago it ran. top_results is never used here, and
+    // leaving the blob out keeps the unbounded scan cheap.
+    all<{ keyword_id: string; check_date: string; error: string | null }>((f, t) =>
       supabase!
         .from("serp_checks")
-        .select("keyword_id, check_date, error, top_results")
+        .select("keyword_id, check_date, error")
         .eq("organisation_id", orgId)
-        .gte("check_date", cutoff)
         .order("check_date", { ascending: false })
+        .order("id")
         .range(f, t),
     ),
   ]);

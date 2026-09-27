@@ -526,9 +526,6 @@ export default async function RankTrackerPage({
   }
   const campaignId = campaign.id;
 
-  const cutoffDate = new Date();
-  cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 30);
-  const cutoff = cutoffDate.toISOString().slice(0, 10);
   const todayStr = new Date().toISOString().slice(0, 10);
 
   const [keywords, watchDomains, { data: sites }] = await Promise.all([
@@ -589,31 +586,35 @@ export default async function RankTrackerPage({
   const checkpoints = [...new Set(watchDomains.map((w) => w.serp_location?.trim()).filter(Boolean))];
   const defaultLocation = checkpoints.length === 1 ? (checkpoints[0] as string) : "United Kingdom";
 
-  // Latest check per keyword (last 30 days) + that day's rankings. Small
-  // campaigns ask for their own keywords only; big ones page the org's rows
-  // and filter, which is cheaper than a very long `in` list.
+  // Every check's metadata (date + error), with NO date bound: the latest
+  // run must show however long ago it ran, and movement compares against the
+  // run before it even when months separate the two. Rows here are tiny —
+  // top_results, a top-100 json blob per row, is deliberately left out and
+  // fetched below for just the dates actually displayed. Small campaigns ask
+  // for their own keywords only; big ones page the org's rows and filter,
+  // which is cheaper than a very long `in` list.
   const checks = !keywords.length
     ? []
     : keywords.length <= SCOPED_MAX
-      ? await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
+      ? await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null }>(
           (from, to) =>
             c.supabase
               .from("serp_checks")
-              .select("keyword_id, check_date, error, top_results")
+              .select("keyword_id, check_date, error")
               .in("keyword_id", [...keywordIds])
-              .gte("check_date", cutoff)
               .order("check_date", { ascending: false })
+              .order("id")
               .range(from, to),
         )
       : (
-          await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null; top_results: TopResult[] }>(
+          await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null }>(
             (from, to) =>
               c.supabase
                 .from("serp_checks")
-                .select("keyword_id, check_date, error, top_results")
+                .select("keyword_id, check_date, error")
                 .eq("organisation_id", c.orgId)
-                .gte("check_date", cutoff)
                 .order("check_date", { ascending: false })
+                .order("id")
                 .range(from, to),
           )
         ).filter((r) => keywordIds.has(r.keyword_id));
@@ -636,13 +637,43 @@ export default async function RankTrackerPage({
   const prevCheckDate = new Map<string, string>(); // keyword -> the check before the latest
   for (const row of checks) {
     if (!latestCheck.has(row.keyword_id)) {
-      latestCheck.set(row.keyword_id, {
-        date: row.check_date,
-        error: row.error,
-        top: row.top_results ?? [],
-      });
+      latestCheck.set(row.keyword_id, { date: row.check_date, error: row.error, top: [] });
     } else if (!prevCheckDate.has(row.keyword_id) && !row.error) {
       prevCheckDate.set(row.keyword_id, row.check_date);
+    }
+  }
+
+  // The SERP top-100 for each keyword's LATEST check — the only place the
+  // heavy top_results column is pulled, and only for the dates on display.
+  const displayDates = [...new Set([...latestCheck.values()].map((v) => v.date))];
+  if (displayDates.length) {
+    const topRows =
+      keywords.length <= SCOPED_MAX
+        ? await fetchAllRows<{ keyword_id: string; check_date: string; top_results: TopResult[] }>(
+            (from, to) =>
+              c.supabase
+                .from("serp_checks")
+                .select("keyword_id, check_date, top_results")
+                .in("keyword_id", [...keywordIds])
+                .in("check_date", displayDates)
+                .order("id")
+                .range(from, to),
+          )
+        : (
+            await fetchAllRows<{ keyword_id: string; check_date: string; top_results: TopResult[] }>(
+              (from, to) =>
+                c.supabase
+                  .from("serp_checks")
+                  .select("keyword_id, check_date, top_results")
+                  .eq("organisation_id", c.orgId)
+                  .in("check_date", displayDates)
+                  .order("id")
+                  .range(from, to),
+            )
+          ).filter((r) => keywordIds.has(r.keyword_id));
+    for (const row of topRows) {
+      const check = latestCheck.get(row.keyword_id);
+      if (check && check.date === row.check_date) check.top = row.top_results ?? [];
     }
   }
   const latestDates = [
