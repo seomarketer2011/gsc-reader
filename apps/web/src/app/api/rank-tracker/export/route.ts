@@ -80,10 +80,10 @@ export async function GET(request: NextRequest) {
     // No date bound: the export mirrors the dashboard, whose latest run must
     // show however long ago it ran. top_results is never used here, and
     // leaving the blob out keeps the unbounded scan cheap.
-    all<{ keyword_id: string; check_date: string; error: string | null }>((f, t) =>
+    all<{ keyword_id: string; check_date: string; error: string | null; organic_count: number | null; search_location: string | null }>((f, t) =>
       supabase!
         .from("serp_checks")
-        .select("keyword_id, check_date, error")
+        .select("keyword_id, check_date, error, organic_count, search_location")
         .eq("organisation_id", orgId)
         .order("check_date", { ascending: false })
         .order("id")
@@ -92,10 +92,20 @@ export async function GET(request: NextRequest) {
   ]);
 
   const keywordIds = new Set(keywords.map((k) => k.id));
-  const latest = new Map<string, { date: string; error: string | null }>();
+  const latest = new Map<
+    string,
+    { date: string; error: string | null; organicCount: number | null; searchLocation: string | null }
+  >();
   for (const row of checks) {
     if (!keywordIds.has(row.keyword_id)) continue; // another campaign's check
-    if (!latest.has(row.keyword_id)) latest.set(row.keyword_id, { date: row.check_date, error: row.error });
+    if (!latest.has(row.keyword_id)) {
+      latest.set(row.keyword_id, {
+        date: row.check_date,
+        error: row.error,
+        organicCount: row.organic_count ?? null,
+        searchLocation: row.search_location ?? null,
+      });
+    }
   }
   const latestDates = [...new Set([...latest.values()].map((v) => v.date))];
   const rankings = latestDates.length
@@ -186,14 +196,23 @@ export async function GET(request: NextRequest) {
     filtered.sort((a, b) => b.ranked.length - a.ranked.length);
   }
 
-  const lines = ["keyword,location,checked,status,domain,domain_home_town,is_home,position,url"];
+  const lines = [
+    "keyword,location,checked,status,domain,domain_home_town,is_home,position,url,serp_results,searched_from",
+  ];
   for (const { k, check, ranked, homeSet } of filtered) {
+    // How many organic results the SERP actually had, and where it was
+    // really fetched from (blank = the keyword's own location) — a
+    // "not_ranking" backed by a thin SERP is a measurement caveat, not a
+    // competitive verdict.
+    const serpSize = check?.organicCount ?? "";
+    const searchedFrom =
+      check?.searchLocation && check.searchLocation !== k.location_name ? check.searchLocation : "";
     if (!check) {
-      lines.push([esc(k.keyword), esc(k.location_name), "", "unchecked", "", "", "", "", ""].join(","));
+      lines.push([esc(k.keyword), esc(k.location_name), "", "unchecked", "", "", "", "", "", "", ""].join(","));
       continue;
     }
     if (check.error) {
-      lines.push([esc(k.keyword), esc(k.location_name), check.date, "failed", "", "", "", "", esc(check.error)].join(","));
+      lines.push([esc(k.keyword), esc(k.location_name), check.date, "failed", "", "", "", "", esc(check.error), "", ""].join(","));
       continue;
     }
     const rankedSet = new Set(ranked.map((r) => r.domain));
@@ -202,7 +221,7 @@ export async function GET(request: NextRequest) {
         [
           esc(k.keyword), esc(k.location_name), check.date, "ranked",
           esc(r.domain), esc(homeLabel.get(r.domain) ?? ""), homeSet.has(r.domain) ? "yes" : "no",
-          r.position, esc(r.url),
+          r.position, esc(r.url), serpSize, esc(searchedFrom),
         ].join(","),
       );
     }
@@ -210,7 +229,7 @@ export async function GET(request: NextRequest) {
     for (const domain of homeSet) {
       if (!rankedSet.has(domain)) {
         lines.push(
-          [esc(k.keyword), esc(k.location_name), check.date, "not_ranking", esc(domain), esc(homeLabel.get(domain) ?? ""), "yes", "", ""].join(","),
+          [esc(k.keyword), esc(k.location_name), check.date, "not_ranking", esc(domain), esc(homeLabel.get(domain) ?? ""), "yes", "", "", serpSize, esc(searchedFrom)].join(","),
         );
       }
     }

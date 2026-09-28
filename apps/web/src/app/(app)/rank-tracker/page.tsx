@@ -5,7 +5,13 @@ import { Badge, Card, EmptyState, PageHeader, StatTile } from "@/components/ui";
 import { PendingButton } from "@/components/PendingButton";
 import { RankCheckButton } from "@/components/RankCheckButton";
 import { getServerClient } from "@/lib/supabase/server";
-import { fetchUkLocations, normaliseDomain, resolveLocation, TopResult } from "@/lib/engine/serp";
+import {
+  fetchUkLocations,
+  normaliseDomain,
+  resolveLocation,
+  THIN_SERP_THRESHOLD,
+  TopResult,
+} from "@/lib/engine/serp";
 import { SupabaseClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
@@ -673,29 +679,34 @@ export default async function RankTrackerPage({
   // fetched below for just the dates actually displayed. Small campaigns ask
   // for their own keywords only; big ones page the org's rows and filter,
   // which is cheaper than a very long `in` list.
+  type CheckMeta = {
+    keyword_id: string;
+    check_date: string;
+    error: string | null;
+    organic_count: number | null;
+    search_location: string | null;
+  };
   const checks = !keywords.length
     ? []
     : keywords.length <= SCOPED_MAX
-      ? await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null }>(
-          (from, to) =>
+      ? await fetchAllRows<CheckMeta>((from, to) =>
+          c.supabase
+            .from("serp_checks")
+            .select("keyword_id, check_date, error, organic_count, search_location")
+            .in("keyword_id", [...keywordIds])
+            .order("check_date", { ascending: false })
+            .order("id")
+            .range(from, to),
+        )
+      : (
+          await fetchAllRows<CheckMeta>((from, to) =>
             c.supabase
               .from("serp_checks")
-              .select("keyword_id, check_date, error")
-              .in("keyword_id", [...keywordIds])
+              .select("keyword_id, check_date, error, organic_count, search_location")
+              .eq("organisation_id", c.orgId)
               .order("check_date", { ascending: false })
               .order("id")
               .range(from, to),
-        )
-      : (
-          await fetchAllRows<{ keyword_id: string; check_date: string; error: string | null }>(
-            (from, to) =>
-              c.supabase
-                .from("serp_checks")
-                .select("keyword_id, check_date, error")
-                .eq("organisation_id", c.orgId)
-                .order("check_date", { ascending: false })
-                .order("id")
-                .range(from, to),
           )
         ).filter((r) => keywordIds.has(r.keyword_id));
 
@@ -713,11 +724,20 @@ export default async function RankTrackerPage({
   const inFlight = queued.filter((r) => keywordIds.has(r.keyword_id)).length;
   const collectedToday = checks.filter((r) => r.check_date === todayStr).length;
 
-  const latestCheck = new Map<string, { date: string; error: string | null; top: TopResult[] }>();
+  const latestCheck = new Map<
+    string,
+    { date: string; error: string | null; organicCount: number | null; searchLocation: string | null; top: TopResult[] }
+  >();
   const prevCheckDate = new Map<string, string>(); // keyword -> the check before the latest
   for (const row of checks) {
     if (!latestCheck.has(row.keyword_id)) {
-      latestCheck.set(row.keyword_id, { date: row.check_date, error: row.error, top: [] });
+      latestCheck.set(row.keyword_id, {
+        date: row.check_date,
+        error: row.error,
+        organicCount: row.organic_count ?? null,
+        searchLocation: row.search_location ?? null,
+        top: [],
+      });
     } else if (!prevCheckDate.has(row.keyword_id) && !row.error) {
       prevCheckDate.set(row.keyword_id, row.check_date);
     }
@@ -1170,6 +1190,17 @@ export default async function RankTrackerPage({
                             <span className="tnum">
                               {ranked.length} of {watchedTotal} rank
                             </span>
+                            {check.organicCount !== null && check.organicCount < THIN_SERP_THRESHOLD && (
+                              <Badge tone="warning">thin SERP · {check.organicCount} results</Badge>
+                            )}
+                            {check.searchLocation && check.searchLocation !== k.location_name && (
+                              <span
+                                className="text-muted"
+                                title={`District SERP was too thin — this check was fetched from ${check.searchLocation}`}
+                              >
+                                via {check.searchLocation.split(",")[0]}
+                              </span>
+                            )}
                             <span className="text-muted">checked {check.date}</span>
                           </>
                         )

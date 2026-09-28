@@ -112,6 +112,7 @@ Applied migrations, in order:
 | `20260802000011_serp_task_queue.sql` | `serp_task_queue` (DataForSEO standard-queue tasks in flight) |
 | `20260802000012_rank_tracker_campaigns.sql` | `campaign_id` required on both tracked tables; existing data backfilled into one campaign per org; uniqueness moved under the campaign |
 | `20260802000013_keyword_location_validation.sql` | `tracked_keywords.location_valid` |
+| `20260928000014_serp_check_quality.sql` | `serp_checks.organic_count` + `serp_checks.search_location` (thin-SERP detection and town-level fallback) |
 
 **When adding a migration:** write a new timestamped `.sql` file, validate it
 (there is a PGlite validator harness used during development — apply all

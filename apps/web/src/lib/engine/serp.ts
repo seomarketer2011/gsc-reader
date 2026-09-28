@@ -15,6 +15,12 @@ export interface TrackedKeyword {
   location_name: string;
 }
 
+/** Below this many organic results a SERP is considered degenerate — some
+ * postcode-district geo-targets make Google return a thin, filtered SERP
+ * (Facebook/directory-dominated) that hides watched sites a town-level
+ * SERP shows. Collection re-checks such keywords from the town. */
+export const THIN_SERP_THRESHOLD = 50;
+
 export interface WatchedDomain {
   domain: string; // normalised: lowercase, no protocol/www/path
   siteId: string | null; // sites.id when GSC-connected
@@ -208,6 +214,7 @@ async function storeSerpResult(
   service: SupabaseClient,
   orgId: string,
   keywordId: string,
+  locationName: string,
   items: SerpItem[],
   watched: WatchedDomain[],
 ): Promise<number> {
@@ -231,12 +238,22 @@ async function storeSerpResult(
     }
   }
 
-  await service
+  const checkRow: Record<string, unknown> = {
+    organisation_id: orgId,
+    keyword_id: keywordId,
+    error: null,
+    organic_count: organic.length,
+    search_location: locationName || null,
+    top_results: topResults,
+  };
+  let { error } = await service
     .from("serp_checks")
-    .upsert(
-      { organisation_id: orgId, keyword_id: keywordId, error: null, top_results: topResults },
-      { onConflict: "keyword_id,check_date" },
-    );
+    .upsert(checkRow, { onConflict: "keyword_id,check_date" });
+  if (error && /organic_count|search_location/.test(error.message)) {
+    const { organic_count: _oc, search_location: _sl, ...stripped } = checkRow;
+    ({ error } = await service.from("serp_checks").upsert(stripped, { onConflict: "keyword_id,check_date" }));
+  }
+  if (error) console.error("serp store: checks upsert failed:", error.message);
   // Replace today's rankings for this keyword so re-runs stay consistent.
   await service
     .from("serp_rankings")
@@ -274,7 +291,7 @@ export async function checkKeyword(
     await recordCheckError(service, orgId, keyword.id, error);
     return { ranked: 0, error };
   }
-  const ranked = await storeSerpResult(service, orgId, keyword.id, items, watched);
+  const ranked = await storeSerpResult(service, orgId, keyword.id, keyword.location_name, items, watched);
   return { ranked, error: null };
 }
 
@@ -409,7 +426,7 @@ export async function collectSerpResults(
   // Fetch results in parallel, then write everything in a handful of BATCHED
   // database calls — this is what lets one pass swallow hundreds of results
   // without hitting Worker subrequest limits.
-  const successes: { row: QueueRow; items: SerpItem[] }[] = [];
+  const successes: { row: QueueRow; items: SerpItem[]; postedLocation: string }[] = [];
   const failures: { row: QueueRow; message: string }[] = [];
   const PARALLEL = 10;
   for (let i = 0; i < toFetch.length; i += PARALLEL) {
@@ -425,7 +442,13 @@ export async function collectSerpResults(
         const task = data.tasks?.[0];
         const code = Number(task?.status_code ?? 0);
         if (code === 20000) {
-          successes.push({ row, items: (task.result?.[0]?.items ?? []) as SerpItem[] });
+          successes.push({
+            row,
+            items: (task.result?.[0]?.items ?? []) as SerpItem[],
+            // Where this SERP was fetched from — differs from the keyword's
+            // stored location when this task was a thin-SERP fallback.
+            postedLocation: typeof task.data?.location_name === "string" ? task.data.location_name : "",
+          });
         } else if (code === 20100 || code === 40601 || code === 40602 || code === 40603) {
           // Still queued/processing (or briefly unfindable) — expire after 24h.
           if (now - new Date(row.posted_at).getTime() > 24 * 3600000) {
@@ -448,16 +471,83 @@ export async function collectSerpResults(
     (f) => !seenKeyword.has(f.row.keyword_id) && (seenKeyword.add(f.row.keyword_id), true),
   );
 
+  // ── Thin-SERP fallback ──────────────────────────────────────────────
+  // A degenerate district SERP (a fraction of the requested depth) hides
+  // watched sites that a town-level SERP shows. When a keyword's OWN
+  // location produced a thin SERP and its district maps to a town that
+  // DataForSEO knows, the keyword is re-posted from the town; that result
+  // replaces this one through the same-day upsert. A fallback result is
+  // never itself re-posted (its posted location differs from the stored
+  // one), so a keyword costs at most one extra check per day.
+  const fallbackKeywords = new Set<string>();
+  const organicCount = (items: SerpItem[]) =>
+    items.filter((i) => i.type === "organic" && i.domain).length;
+  const thinPrimary = uniqueSuccesses.filter((s) => organicCount(s.items) < THIN_SERP_THRESHOLD);
+  if (thinPrimary.length > 0) {
+    try {
+      const ids = thinPrimary.map((s) => s.row.keyword_id);
+      const kwById = new Map<string, TrackedKeyword>();
+      for (let i = 0; i < ids.length; i += 100) {
+        const { data } = await service
+          .from("tracked_keywords")
+          .select("id, keyword, location_name")
+          .in("id", ids.slice(i, i + 100));
+        for (const k of (data ?? []) as TrackedKeyword[]) kwById.set(k.id, k);
+      }
+      const townByDistrict = new Map<string, string>();
+      for (let from = 0; ; from += QUEUE_PAGE) {
+        const { data } = await service
+          .from("tracked_domains")
+          .select("location, serp_location")
+          .eq("organisation_id", orgId)
+          .order("id")
+          .range(from, from + QUEUE_PAGE - 1);
+        for (const d of (data ?? []) as { location: string | null; serp_location: string | null }[]) {
+          const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
+          const town = d.location?.trim();
+          if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc) && !townByDistrict.has(pc)) {
+            townByDistrict.set(pc, town);
+          }
+        }
+        if (!data || data.length < QUEUE_PAGE) break;
+      }
+      const locations = await fetchUkLocations();
+      const toFallback: TrackedKeyword[] = [];
+      for (const s of thinPrimary) {
+        const kw = kwById.get(s.row.keyword_id);
+        if (!kw) continue;
+        if (s.postedLocation && s.postedLocation !== kw.location_name) continue; // already the fallback
+        const district = kw.location_name.split(",")[0].trim().toLowerCase();
+        if (!/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(district)) continue; // not a district checkpoint
+        const town = townByDistrict.get(district);
+        if (!town) continue;
+        const resolved = resolveLocation(locations, `${town},England,United Kingdom`);
+        if (!resolved.valid || resolved.name === kw.location_name) continue;
+        toFallback.push({ id: kw.id, keyword: kw.keyword, location_name: resolved.name });
+      }
+      if (toFallback.length > 0) {
+        await postSerpTasks(service, orgId, toFallback);
+        for (const k of toFallback) fallbackKeywords.add(k.id);
+        console.log(`serp collect: thin SERPs — re-posted ${toFallback.length} keyword(s) from town-level locations`);
+      }
+    } catch (e) {
+      // The thin result is stored either way; the fallback is best-effort.
+      console.error("serp collect: thin-SERP fallback failed:", e instanceof Error ? e.message : e);
+    }
+  }
+
   const byDomain = new Map(watched.map((w) => [w.domain, w]));
   const today = new Date().toISOString().slice(0, 10);
   const checkRows: Record<string, unknown>[] = [];
   const rankingRows: Record<string, unknown>[] = [];
-  for (const { row, items } of uniqueSuccesses) {
+  for (const { row, items, postedLocation } of uniqueSuccesses) {
     const organic = items.filter((i) => i.type === "organic" && i.domain);
     checkRows.push({
       organisation_id: orgId,
       keyword_id: row.keyword_id,
       error: null,
+      organic_count: organic.length,
+      search_location: postedLocation || null,
       top_results: organic.slice(0, 10).map((i) => ({
         position: i.rank_group,
         domain: normaliseDomain(i.domain!),
@@ -491,6 +581,8 @@ export async function collectSerpResults(
       organisation_id: orgId,
       keyword_id: row.keyword_id,
       error: message.slice(0, 300),
+      organic_count: null,
+      search_location: null,
       top_results: [],
     });
   }
@@ -501,9 +593,19 @@ export async function collectSerpResults(
   const unwritten = new Set<string>();
   for (let i = 0; i < checkRows.length; i += CHUNK) {
     const slice = checkRows.slice(i, i + CHUNK);
-    const { error } = await service
+    let { error } = await service
       .from("serp_checks")
       .upsert(slice, { onConflict: "keyword_id,check_date" });
+    if (error && /organic_count|search_location/.test(error.message)) {
+      // serp_check_quality migration not applied yet — store the checks
+      // without the quality fields rather than dropping the results.
+      console.error("serp collect: serp_check_quality columns missing — apply the migration; storing without them");
+      const stripped = slice.map((r) => {
+        const { organic_count: _oc, search_location: _sl, ...rest } = r;
+        return rest;
+      });
+      ({ error } = await service.from("serp_checks").upsert(stripped, { onConflict: "keyword_id,check_date" }));
+    }
     if (error) {
       console.error("serp collect: checks upsert failed:", error.message);
       for (const r of slice) unwritten.add(r.keyword_id as string);
@@ -543,9 +645,17 @@ export async function collectSerpResults(
     }
   }
   // Clear ALL processed queue rows (including a double-post's extra row);
-  // synthetic orphan rows have no database id to delete.
+  // synthetic orphan rows have no database id to delete. A keyword whose
+  // fallback was just posted keeps its queue row — the upsert re-pointed it
+  // at the new task, and deleting it would orphan that task.
   const doneRowIds = [...successes, ...failures]
-    .filter((s) => s.row.id && !unwritten.has(s.row.keyword_id) && !rankingsFailed.has(s.row.keyword_id))
+    .filter(
+      (s) =>
+        s.row.id &&
+        !unwritten.has(s.row.keyword_id) &&
+        !rankingsFailed.has(s.row.keyword_id) &&
+        !fallbackKeywords.has(s.row.keyword_id),
+    )
     .map((s) => s.row.id);
   for (let i = 0; i < doneRowIds.length; i += CHUNK) {
     await service.from("serp_task_queue").delete().in("id", doneRowIds.slice(i, i + CHUNK));
