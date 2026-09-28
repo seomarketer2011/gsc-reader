@@ -1381,6 +1381,8 @@ export default async function RankTrackerPage({
                 {view !== "all" && <input type="hidden" name="view" value={view} />}
                 {sort !== "az" && <input type="hidden" name="sort" value={sort} />}
                 <input
+                  type="search"
+                  enterKeyHint="search"
                   name="q"
                   defaultValue={q}
                   placeholder="Filter by keyword or town… (Enter to apply)"
