@@ -214,10 +214,10 @@ async function generateKeywords(formData: FormData) {
   const suffix = String(formData.get("suffix") ?? "").trim() || "England,United Kingdom";
   if (patterns.length === 0) return;
 
-  const domains = await fetchAllRows<{ location: string | null; serp_location: string | null }>((from, to) =>
+  const domains = await fetchAllRows<{ domain: string; location: string | null; serp_location: string | null }>((from, to) =>
     c.supabase
       .from("tracked_domains")
-      .select("location, serp_location")
+      .select("domain, location, serp_location")
       .eq("campaign_id", c.campaignId)
       .not("location", "is", null)
       .order("id")
@@ -227,12 +227,20 @@ async function generateKeywords(formData: FormData) {
   // checkpoint (serp_location — e.g. "BR1") when one was imported. Keyed on
   // town+checkpoint so two places sharing a name (Plaistow BR1 vs Plaistow
   // E13) each get their own keyword set, checked from their own area.
-  const pairs = new Map<string, { town: string; checkpoint: string }>();
+  const pairs = new Map<string, { town: string; checkpoint: string; pc: string | null }>();
   for (const d of domains) {
     const town = (d.location as string).trim();
     if (!town) continue;
     const checkpoint = d.serp_location?.trim() || town;
-    pairs.set(`${town.toLowerCase()}|${checkpoint.toLowerCase()}`, { town, checkpoint });
+    // District for "{postcode}" branding: the checkpoint when it is one,
+    // otherwise the district embedded in the domain name (sw18locksmith…) —
+    // checkpoints migrate to town level, but the brand keeps its district.
+    const fromCheckpoint = checkpoint.split(",")[0].trim().toLowerCase();
+    const pc = /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(fromCheckpoint)
+      ? fromCheckpoint
+      : (d.domain.toLowerCase().match(/^([a-z]{1,2}\d{1,2})(?=[a-z])/)?.[1] ?? null);
+    const key = `${town.toLowerCase()}|${checkpoint.toLowerCase()}`;
+    if (!pairs.has(key)) pairs.set(key, { town, checkpoint, pc });
   }
 
   const rows: {
@@ -256,7 +264,7 @@ async function generateKeywords(formData: FormData) {
       });
     }
   } else {
-    for (const { town, checkpoint } of pairs.values()) {
+    for (const { town, checkpoint, pc } of pairs.values()) {
       // Imported checkpoints are already canonical full names; anything else
       // gets the suffix and is resolved here, so every keyword is stored with
       // the exact location its SERP will be fetched from.
@@ -264,18 +272,15 @@ async function generateKeywords(formData: FormData) {
         locations,
         checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`,
       );
-      // "{postcode}" fills with the checkpoint's postcode district ("CR8" ->
-      // "cr8") — how the network's brand names are built ("cr8 locksmith
-      // purley"). Towns whose checkpoint isn't a district skip such patterns:
-      // there is no brand to word.
-      const pc = checkpoint.split(",")[0].trim().toLowerCase();
-      const hasDistrict = /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc);
+      // "{postcode}" fills with the domain's district ("cr8") — how the
+      // network's brand names are built ("cr8 locksmith purley"). Domains
+      // with no district anywhere skip such patterns: no brand to word.
       for (const p of patterns) {
-        if (p.includes("{postcode}") && !hasDistrict) continue;
+        if (p.includes("{postcode}") && !pc) continue;
         rows.push({
           ...base,
           keyword: p
-            .replaceAll("{postcode}", pc)
+            .replaceAll("{postcode}", pc ?? "")
             .replaceAll("{location}", town.toLowerCase())
             .replace(/\s+/g, " ")
             .trim(),
@@ -407,6 +412,86 @@ async function revalidateLocations(formData: FormData) {
     }
   }
   revalidatePath("/rank-tracker");
+}
+
+/** Switches every postcode-district checkpoint in this campaign to its
+ * town's own geo-target (borough forms resolve automatically) and moves the
+ * keywords with it. District targets give Google a low-confidence location
+ * and often draw a degraded, directory-only SERP no real user sees;
+ * town-level targets match what people in the area actually get. Towns that
+ * don't resolve (missing or ambiguous in DataForSEO's list) keep their
+ * district — the thin-SERP fallback still covers those. */
+async function migrateCheckpointsToTowns(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const locations = await fetchUkLocations();
+  if (!locations) return; // lookup unavailable — change nothing
+  const domains = await fetchAllRows<{ id: string; location: string | null; serp_location: string | null }>(
+    (from, to) =>
+      c.supabase
+        .from("tracked_domains")
+        .select("id, location, serp_location")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+  );
+  const isDistrict = (s: string) => /^[a-z]{1,2}\d{1,2}[a-z]?$/i.test(s.split(",")[0].trim());
+  const renames = new Map<string, string>(); // old canonical checkpoint -> new
+  let migrated = 0;
+  let unchanged = 0;
+  for (const d of domains) {
+    const town = d.location?.trim();
+    const current = d.serp_location?.trim();
+    if (!town || !current || !isDistrict(current)) {
+      unchanged++;
+      continue;
+    }
+    const resolvedName = renames.has(current)
+      ? renames.get(current)!
+      : (() => {
+          const r = resolveLocation(locations, town);
+          return r.valid ? r.name : null;
+        })();
+    if (!resolvedName || resolvedName === current) {
+      unchanged++;
+      continue;
+    }
+    await c.supabase
+      .from("tracked_domains")
+      .update({ serp_location: resolvedName, location_valid: true })
+      .eq("id", d.id);
+    renames.set(current, resolvedName);
+    migrated++;
+  }
+  for (const [oldName, newName] of renames) {
+    const { error } = await c.supabase
+      .from("tracked_keywords")
+      .update({ location_name: newName, location_valid: true })
+      .eq("campaign_id", c.campaignId)
+      .eq("location_name", oldName);
+    if (error) {
+      // A keyword already exists at the new location — move rows one by one
+      // and leave any duplicate at its old location rather than lose history.
+      const rows = await fetchAllRows<{ id: string }>((from, to) =>
+        c.supabase
+          .from("tracked_keywords")
+          .select("id")
+          .eq("campaign_id", c.campaignId)
+          .eq("location_name", oldName)
+          .order("id")
+          .range(from, to),
+      );
+      for (const r of rows) {
+        await c.supabase
+          .from("tracked_keywords")
+          .update({ location_name: newName, location_valid: true })
+          .eq("id", r.id);
+      }
+    }
+  }
+  revalidatePath("/rank-tracker");
+  redirect(`/rank-tracker?campaign=${c.campaignId}&migrated=${migrated}&unchanged=${unchanged}`);
 }
 
 async function deleteKeyword(formData: FormData) {
@@ -990,6 +1075,17 @@ export default async function RankTrackerPage({
         </details>
       </div>
 
+      {typeof params.migrated === "string" && (
+        <Card className="mb-4 border-good/40 p-3 text-sm text-ink">
+          <span className="font-medium">Checkpoints migrated:</span>{" "}
+          <span className="tnum">{params.migrated}</span> domains now check from town-level
+          locations ({typeof params.unchanged === "string" ? params.unchanged : 0} unchanged —
+          already town-level or no resolvable town), and their keywords moved with them. Keywords
+          not yet checked today pick the new locations up on the next “Check rankings now”;
+          keywords already checked today re-check under them from tomorrow.
+        </Card>
+      )}
+
       {inFlight > 0 && (
         <Card className="mb-4 border-series-1/40 p-3 text-sm text-ink">
           <span className="font-medium">Rank check in progress:</span>{" "}
@@ -1420,6 +1516,21 @@ export default async function RankTrackerPage({
               </p>
             </div>
           </details>
+          <form action={migrateCheckpointsToTowns} className="mt-3">
+            <input type="hidden" name="campaign" value={campaignId} />
+            <PendingButton
+              pendingLabel="Migrating checkpoints…"
+              className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+            >
+              Switch checkpoints to town level (recommended)
+            </PendingButton>
+            <p className="mt-1 text-xs text-muted">
+              Postcode-district geo-targets often draw a degraded, directory-only SERP that no real
+              user sees. This moves every district checkpoint (and its keywords) to the town&rsquo;s
+              own geo-target where one resolves; districts without one keep their checkpoint and
+              rely on the thin-SERP fallback instead. Safe to press again any time.
+            </p>
+          </form>
           {watchDomains.some((w) => w.location_valid === false) && (
             <p className="mt-2 text-xs text-critical">
               {watchDomains.filter((w) => w.location_valid === false).length} imported{" "}
