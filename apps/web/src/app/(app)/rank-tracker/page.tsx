@@ -9,6 +9,7 @@ import {
   fetchUkLocations,
   normaliseDomain,
   resolveLocation,
+  resolveTownForDistrict,
   THIN_SERP_THRESHOLD,
   TopResult,
 } from "@/lib/engine/serp";
@@ -437,22 +438,30 @@ async function migrateCheckpointsToTowns(formData: FormData) {
         .range(from, to),
   );
   const isDistrict = (s: string) => /^[a-z]{1,2}\d{1,2}[a-z]?$/i.test(s.split(",")[0].trim());
+  // A checkpoint shared by two DIFFERENT towns cannot migrate: both towns'
+  // keywords carry the same stored location, so a rename cannot split them.
+  const townsByCheckpoint = new Map<string, Set<string>>();
+  for (const d of domains) {
+    const town = d.location?.trim().toLowerCase();
+    const current = d.serp_location?.trim();
+    if (!town || !current) continue;
+    const set = townsByCheckpoint.get(current) ?? new Set<string>();
+    set.add(town);
+    townsByCheckpoint.set(current, set);
+  }
   const renames = new Map<string, string>(); // old canonical checkpoint -> new
   let migrated = 0;
   let unchanged = 0;
   for (const d of domains) {
     const town = d.location?.trim();
     const current = d.serp_location?.trim();
-    if (!town || !current || !isDistrict(current)) {
+    if (!town || !current || !isDistrict(current) || (townsByCheckpoint.get(current)?.size ?? 0) > 1) {
       unchanged++;
       continue;
     }
     const resolvedName = renames.has(current)
       ? renames.get(current)!
-      : (() => {
-          const r = resolveLocation(locations, town);
-          return r.valid ? r.name : null;
-        })();
+      : await resolveTownForDistrict(locations, town, current.split(",")[0].trim());
     if (!resolvedName || resolvedName === current) {
       unchanged++;
       continue;

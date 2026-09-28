@@ -137,6 +137,81 @@ export function resolveLocation(
   return { name: raw, valid: false, alternatives: [] };
 }
 
+// ── Outcode lookup (postcodes.io) + best-effort town resolution ────────────
+
+interface OutcodeInfo {
+  adminDistricts: string[];
+  region: string | null;
+}
+
+const outcodeCache = new Map<string, OutcodeInfo | null>();
+
+/** Council area(s) and region for a postcode district ("SE19" -> Croydon…),
+ * from postcodes.io (free, no key). Cached per instance; null on failure. */
+async function lookupOutcode(outcode: string): Promise<OutcodeInfo | null> {
+  const key = outcode.trim().toUpperCase();
+  if (outcodeCache.has(key)) return outcodeCache.get(key)!;
+  let info: OutcodeInfo | null = null;
+  try {
+    const res = await fetch(`https://api.postcodes.io/outcodes/${encodeURIComponent(key)}`);
+    if (res.ok) {
+      const data = (await res.json()) as {
+        result?: { admin_district?: (string | null)[]; region?: (string | null)[] | string | null };
+      };
+      const r = data.result;
+      if (r) {
+        const region = Array.isArray(r.region) ? r.region.find(Boolean) ?? null : (r.region ?? null);
+        info = {
+          adminDistricts: (r.admin_district ?? []).filter((d): d is string => Boolean(d)),
+          region,
+        };
+      }
+    }
+  } catch {
+    // network failure — resolution just falls back to the plain-name path
+  }
+  outcodeCache.set(key, info);
+  return info;
+}
+
+/**
+ * Resolves a town to the most realistic geo-target available, using the
+ * domain's postcode district to break ties and to stand in for towns the
+ * location list doesn't know:
+ *   1. the town itself (borough forms resolve automatically);
+ *   2. an AMBIGUOUS town: the alternative whose region matches the
+ *      district's council/region (Richmond + TW9 -> the Greater London one);
+ *   3. an UNLISTED town: the district's council area (SE19 -> Croydon),
+ *      which Google resolves confidently, unlike the district itself.
+ * Returns null when nothing resolves — callers keep the district.
+ */
+export async function resolveTownForDistrict(
+  index: UkLocationIndex | null,
+  town: string,
+  outcode: string | null,
+): Promise<string | null> {
+  const first = resolveLocation(index, town);
+  if (first.valid) return first.name;
+  const info = outcode ? await lookupOutcode(outcode) : null;
+  if (first.alternatives.length > 0 && info) {
+    const hints = [...info.adminDistricts, info.region ?? ""]
+      .filter(Boolean)
+      .map((h) => h.toLowerCase());
+    const matches = first.alternatives.filter((alt) => {
+      const rest = alt.toLowerCase().split(",").slice(1).join(",");
+      return hints.some((h) => rest.includes(h));
+    });
+    if (matches.length === 1) return matches[0];
+  }
+  if (info) {
+    for (const council of info.adminDistricts) {
+      const r = resolveLocation(index, council);
+      if (r.valid) return r.name;
+    }
+  }
+  return null;
+}
+
 interface SerpItem {
   type: string;
   rank_group: number;
@@ -494,7 +569,9 @@ export async function collectSerpResults(
           .in("id", ids.slice(i, i + 100));
         for (const k of (data ?? []) as TrackedKeyword[]) kwById.set(k.id, k);
       }
-      const townByDistrict = new Map<string, string>();
+      // District -> its town; null marks a district shared by DIFFERENT
+      // towns, where a single fallback location cannot be trusted.
+      const townByDistrict = new Map<string, string | null>();
       for (let from = 0; ; from += QUEUE_PAGE) {
         const { data } = await service
           .from("tracked_domains")
@@ -505,8 +582,11 @@ export async function collectSerpResults(
         for (const d of (data ?? []) as { location: string | null; serp_location: string | null }[]) {
           const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
           const town = d.location?.trim();
-          if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc) && !townByDistrict.has(pc)) {
-            townByDistrict.set(pc, town);
+          if (!pc || !town || !/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) continue;
+          const existing = townByDistrict.get(pc);
+          if (existing === undefined) townByDistrict.set(pc, town);
+          else if (existing !== null && existing.toLowerCase() !== town.toLowerCase()) {
+            townByDistrict.set(pc, null);
           }
         }
         if (!data || data.length < QUEUE_PAGE) break;
@@ -521,9 +601,9 @@ export async function collectSerpResults(
         if (!/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(district)) continue; // not a district checkpoint
         const town = townByDistrict.get(district);
         if (!town) continue;
-        const resolved = resolveLocation(locations, `${town},England,United Kingdom`);
-        if (!resolved.valid || resolved.name === kw.location_name) continue;
-        toFallback.push({ id: kw.id, keyword: kw.keyword, location_name: resolved.name });
+        const name = await resolveTownForDistrict(locations, town, district);
+        if (!name || name === kw.location_name) continue;
+        toFallback.push({ id: kw.id, keyword: kw.keyword, location_name: name });
       }
       if (toFallback.length > 0) {
         await postSerpTasks(service, orgId, toFallback);
