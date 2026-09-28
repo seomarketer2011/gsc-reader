@@ -12,6 +12,8 @@ import {
 import { getServerClient, getServiceClient } from "@/lib/supabase/server";
 import { hasImportedData } from "@/lib/data/real";
 import { PropertyTable } from "@/components/PropertyTable";
+import { NetworkConnect } from "@/components/NetworkConnect";
+import { cloudflareConfigured } from "@/lib/cloudflare/zones";
 
 export const dynamic = "force-dynamic";
 
@@ -114,7 +116,7 @@ export default async function ConnectionsPage({
     <div>
       <PageHeader
         title="Google connections"
-        subtitle="Read-only access to Search Console. You sign in with Google directly — this app never sees your password."
+        subtitle="Search Console access — reading performance data, and (for the network-connect flow) verifying domains and registering properties. You sign in with Google directly; this app never sees your password."
       >
         <Link
           href="/api/google/start"
@@ -140,6 +142,21 @@ export default async function ConnectionsPage({
           (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET).
         </Card>
       )}
+
+      {cloudflareConfigured() &&
+        (connections ?? []).some((c) => (c as ConnectionRow).status === "active") && (
+          <Card className="mb-4 p-4">
+            <div className="mb-2 text-sm font-medium text-ink">
+              Network domains — Cloudflare → Search Console
+            </div>
+            <NetworkConnect />
+            <p className="mt-2 text-xs text-muted">
+              Each batch: fetches a Google verification token per domain, writes the TXT record on
+              its Cloudflare zone, verifies, and registers the domain property. Idempotent — a
+              half-finished domain just completes next press. Nothing runs on a schedule.
+            </p>
+          </Card>
+        )}
 
       {(connections ?? []).length === 0 ? (
         <EmptyState

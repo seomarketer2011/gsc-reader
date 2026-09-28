@@ -69,6 +69,17 @@ The connected Google account for GSC data is `pauldanielstone@gmail.com`.
 | `DATAFORSEO_LOGIN` | DataForSEO account email | Search-volume API auth | NO — secret |
 | `DATAFORSEO_PASSWORD` | DataForSEO dashboard → **API Access** (a generated API password, NOT the website password) | Search-volume API auth | NO — secret |
 | `CRON_SECRET` | Generated once: `openssl rand -hex 24` | Guards both `/api/cron/*` endpoints | **NO — secret** |
+| `CLOUDFLARE_EMAIL` | Cloudflare account email | Network-connect: list zones, write DNS verification TXT records | NO — secret |
+| `CLOUDFLARE_API_KEY` | Cloudflare dashboard → My Profile → API Tokens → Global API Key | same | **NO — secret** |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare dashboard (also pinned in `wrangler.jsonc`) | Scopes zone listing to the network's account | NO |
+
+**Network-connect flow** (`/connections` → "Network domains"): verifies every
+Cloudflare zone with Google (DNS TXT) and registers it as a Search Console
+domain property, one 20-domain batch per button press. Requires (1) the three
+`CLOUDFLARE_*` secrets above on the Worker, (2) the **Site Verification API**
+enabled in the Google Cloud project, and (3) a Google connection made after
+the scope expansion (`webmasters` + `siteverification` — older read-only
+connections are prompted to reconnect in place).
 
 If `TOKEN_ENCRYPTION_KEY` is ever lost or changed, existing stored Google
 refresh tokens become undecryptable — every Google connection must be
