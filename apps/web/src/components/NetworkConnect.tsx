@@ -6,6 +6,8 @@ interface Status {
   zones?: number;
   connected?: number;
   remaining?: number;
+  connectedDomains?: string[];
+  pendingDomains?: string[];
   needsReauth?: boolean;
   error?: string;
 }
@@ -24,6 +26,7 @@ interface BatchResult {
 export function NetworkConnect() {
   const [status, setStatus] = useState<Status | null>(null);
   const [running, setRunning] = useState(false);
+  const [batchSize, setBatchSize] = useState(10); // small first batch by design
   const [log, setLog] = useState<string[]>([]);
   const [failures, setFailures] = useState<BatchResult["failed"]>([]);
 
@@ -46,7 +49,7 @@ export function NetworkConnect() {
       const res = await fetch("/api/google/network-connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ batch: batchSize }),
       });
       const data = (await res.json()) as BatchResult;
       if (data.needsReauth) {
@@ -92,13 +95,26 @@ export function NetworkConnect() {
         Search Console{done ? " — all connected." : `; ${status.remaining} to go.`}
       </p>
       {!done && (
-        <button
-          onClick={runBatch}
-          disabled={running}
-          className="rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {running ? "Connecting batch…" : "Verify + connect next 20"}
-        </button>
+        <span className="inline-flex items-center gap-2">
+          <button
+            onClick={runBatch}
+            disabled={running}
+            className="rounded-md bg-series-1 px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {running ? "Connecting batch…" : `Verify + connect next ${batchSize}`}
+          </button>
+          <select
+            value={batchSize}
+            onChange={(e) => setBatchSize(Number(e.target.value))}
+            disabled={running}
+            aria-label="Batch size"
+            className="rounded-md border border-edge bg-surface px-2 py-1.5 text-sm text-ink"
+          >
+            <option value={10}>10 at a time</option>
+            <option value={20}>20 at a time</option>
+            <option value={50}>50 at a time</option>
+          </select>
+        </span>
       )}
       {log.map((line, i) => (
         <p key={i} className={i === 0 ? "text-ink-2" : "text-muted"}>
@@ -116,6 +132,30 @@ export function NetworkConnect() {
             Failed domains are retried automatically on the next batch press.
           </p>
         </div>
+      )}
+      {(status.connectedDomains?.length ?? 0) > 0 && (
+        <details className="text-xs text-ink-2">
+          <summary className="cursor-pointer select-none text-muted hover:text-ink">
+            Show connected domains ({status.connectedDomains!.length})
+          </summary>
+          <div className="mt-1 grid gap-x-4 gap-y-0.5 sm:grid-cols-2 lg:grid-cols-3">
+            {status.connectedDomains!.map((d) => (
+              <span key={d} className="truncate">{d}</span>
+            ))}
+          </div>
+        </details>
+      )}
+      {(status.pendingDomains?.length ?? 0) > 0 && (
+        <details className="text-xs text-ink-2">
+          <summary className="cursor-pointer select-none text-muted hover:text-ink">
+            Show remaining domains ({status.pendingDomains!.length})
+          </summary>
+          <div className="mt-1 grid gap-x-4 gap-y-0.5 sm:grid-cols-2 lg:grid-cols-3">
+            {status.pendingDomains!.map((d) => (
+              <span key={d} className="truncate text-muted">{d}</span>
+            ))}
+          </div>
+        </details>
       )}
     </div>
   );

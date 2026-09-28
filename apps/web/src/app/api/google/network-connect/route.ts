@@ -67,10 +67,17 @@ export async function GET() {
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
   try {
     const { zones, pending } = await progress(c.accessToken);
+    const pendingNames = new Set(pending.map((z) => z.name));
     return NextResponse.json({
       zones: zones.length,
       connected: zones.length - pending.length,
       remaining: pending.length,
+      // Sorted name lists so the UI can show exactly which domains are done.
+      connectedDomains: zones
+        .map((z) => z.name)
+        .filter((n) => !pendingNames.has(n))
+        .sort(),
+      pendingDomains: pending.map((z) => z.name).sort(),
     });
   } catch (e) {
     if (e instanceof GoogleScopeError) return NextResponse.json({ needsReauth: true, error: e.message }, { status: 403 });
