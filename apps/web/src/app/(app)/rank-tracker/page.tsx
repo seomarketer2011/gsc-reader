@@ -1156,7 +1156,7 @@ export default async function RankTrackerPage({
           </div>
 
           <div className="space-y-3">
-            {visible.slice(0, limit).map(({ k, check, ranked, hasHome, homeSet, home, overlap }) => {
+            {visible.slice(0, limit).map(({ k, check, ranked, hasHome, homeSet, home, overlap }, cardIndex) => {
               const rankedDomains = new Set(ranked.map((r) => r.domain));
               const notRankingCount = watchedTotal - rankedDomains.size;
               const isOpen = openId === k.id;
@@ -1166,6 +1166,10 @@ export default async function RankTrackerPage({
                 <Card className="p-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
+                      {/* Position in the CURRENT view (filter + sort), so
+                          "no. 47" is meaningful in context and re-numbers as
+                          the filters change. */}
+                      <span className="tnum mr-1.5 text-xs text-muted">{cardIndex + 1}.</span>
                       <span className="text-sm font-semibold text-ink">{k.keyword}</span>
                       <span
                         className={`ml-2 text-xs ${k.location_valid === false ? "text-critical" : "text-muted"}`}
