@@ -106,6 +106,10 @@ export async function POST(request: NextRequest) {
   const batch = pending.slice(0, batchSize);
   const connected: string[] = [];
   const failed: { domain: string; step: string; error: string }[] = [];
+  // Domains whose TXT was written but Google's resolver hadn't seen it yet —
+  // retried once more after the rest of the batch, by which point the record
+  // has had a minute or two to settle.
+  const verifyLagged: string[] = [];
 
   for (const zone of batch) {
     let step = "verification token";
@@ -123,9 +127,13 @@ export async function POST(request: NextRequest) {
           await verifyDnsDomain(c.accessToken, zone.name);
           verified = true;
         } catch (e) {
-          if (e instanceof GoogleScopeError || attempt === 2) throw e;
+          if (e instanceof GoogleScopeError) throw e;
+          if (attempt === 2) {
+            verifyLagged.push(zone.name);
+          }
         }
       }
+      if (!verified) continue; // picked up in the end-of-batch retry below
       step = "register property";
       await addSearchConsoleDomain(c.accessToken, zone.name);
       connected.push(zone.name);
@@ -137,6 +145,30 @@ export async function POST(request: NextRequest) {
         );
       }
       failed.push({ domain: zone.name, step, error: e instanceof Error ? e.message.slice(0, 200) : "failed" });
+    }
+  }
+
+  // End-of-batch second chance for resolver-lagged domains.
+  for (const domain of verifyLagged) {
+    let step = "verify (retry)";
+    try {
+      await new Promise((r) => setTimeout(r, 2000));
+      await verifyDnsDomain(c.accessToken, domain);
+      step = "register property";
+      await addSearchConsoleDomain(c.accessToken, domain);
+      connected.push(domain);
+    } catch (e) {
+      if (e instanceof GoogleScopeError) {
+        return NextResponse.json(
+          { needsReauth: true, error: e.message, connected, failed },
+          { status: 403 },
+        );
+      }
+      failed.push({
+        domain,
+        step,
+        error: e instanceof Error ? e.message.slice(0, 200) : "failed",
+      });
     }
   }
 
