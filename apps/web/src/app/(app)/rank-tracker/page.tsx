@@ -5,6 +5,7 @@ import { Badge, Card, EmptyState, PageHeader, StatTile } from "@/components/ui";
 import { PendingButton } from "@/components/PendingButton";
 import { RankCheckButton } from "@/components/RankCheckButton";
 import { getServerClient } from "@/lib/supabase/server";
+import { getVolumes } from "@/lib/engine/volumes";
 import {
   fetchUkLocations,
   normaliseDomain,
@@ -714,6 +715,28 @@ async function recheckHomeMissing(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/** Fetches (and caches for 30 days) Google Ads UK search volumes for every
+ * keyword in this campaign that has none yet. Chunked so request URLs stay
+ * sane; only missing/stale keywords are paid for. */
+async function fetchVolumesAction(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const rows = await fetchAllRows<{ keyword: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("keyword")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  const unique = [...new Set(rows.map((r) => r.keyword.toLowerCase().trim()).filter(Boolean))];
+  for (let i = 0; i < unique.length; i += 150) {
+    await getVolumes(c.supabase, c.orgId, unique.slice(i, i + 150));
+  }
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteDomain(formData: FormData) {
   "use server";
   const c = await caller();
@@ -837,6 +860,23 @@ export default async function RankTrackerPage({
     c.supabase.from("sites").select("id, domain").eq("organisation_id", c.orgId),
   ]);
   const keywordIds = new Set(keywords.map((k) => k.id));
+
+  // Cached Google Ads UK volumes for display — reads the cache only, never
+  // pays; the "Fetch search volumes" button fills gaps on demand.
+  const volumeByKeyword = new Map<string, number | null>();
+  {
+    const texts = [...new Set(keywords.map((k) => k.keyword))];
+    for (let i = 0; i < texts.length; i += 150) {
+      const { data } = await c.supabase
+        .from("keyword_volumes")
+        .select("keyword, search_volume")
+        .eq("organisation_id", c.orgId)
+        .in("keyword", texts.slice(i, i + 150));
+      for (const r of data ?? []) {
+        volumeByKeyword.set(r.keyword as string, (r.search_volume as number | null) ?? null);
+      }
+    }
+  }
 
   // Watched universe: exactly this campaign's domains. gsc marks the ones
   // that are also GSC-connected sites. homeKey matches a domain to the
@@ -1104,6 +1144,12 @@ export default async function RankTrackerPage({
   } else if (sort === "sites") {
     visible.sort(
       (a, b) => b.ranked.length - a.ranked.length || a.k.keyword.localeCompare(b.k.keyword),
+    );
+  } else if (sort === "volume") {
+    visible.sort(
+      (a, b) =>
+        (volumeByKeyword.get(b.k.keyword) ?? -1) - (volumeByKeyword.get(a.k.keyword) ?? -1) ||
+        a.k.keyword.localeCompare(b.k.keyword),
     );
   }
 
@@ -1375,6 +1421,22 @@ export default async function RankTrackerPage({
                 </form>
               ) : null;
             })()}
+            {(() => {
+              const missingVol = new Set(
+                keywords.filter((k) => !volumeByKeyword.has(k.keyword)).map((k) => k.keyword),
+              ).size;
+              return missingVol > 0 ? (
+                <form action={fetchVolumesAction}>
+                  <input type="hidden" name="campaign" value={campaignId} />
+                  <PendingButton
+                    pendingLabel="Fetching volumes…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Fetch search volumes ({missingVol} keywords, pennies)
+                  </PendingButton>
+                </form>
+              ) : null;
+            })()}
             <span className="ml-auto flex items-center gap-2">
               <form method="GET" className="flex items-center gap-2">
                 <input type="hidden" name="campaign" value={campaignId} />
@@ -1406,6 +1468,7 @@ export default async function RankTrackerPage({
             {sortLink("best", "Best position")}
             {sortLink("home", "Home position")}
             {sortLink("sites", "Sites ranking")}
+            {volumeByKeyword.size > 0 && sortLink("volume", "Volume")}
           </div>
 
           <div className="space-y-3">
@@ -1431,6 +1494,14 @@ export default async function RankTrackerPage({
                         from {k.location_name}
                         {k.location_valid === false && " ⚠ not a DataForSEO location"}
                       </span>
+                      {volumeByKeyword.has(k.keyword) && (
+                        <span
+                          className="tnum ml-2 text-xs text-muted"
+                          title="Google Ads average monthly searches, UK-wide"
+                        >
+                          {volumeByKeyword.get(k.keyword) ?? 0}/mo
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-3 text-xs text-ink-2">
                       {check ? (
