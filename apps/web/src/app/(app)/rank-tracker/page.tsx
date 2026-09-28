@@ -606,6 +606,96 @@ async function recheckMissingRankings(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/** Deletes TODAY's checks for keywords whose home-town site recorded no
+ * ranking, so "Check rankings now" redoes them the same day — e.g. straight
+ * after a checkpoint migration, rather than waiting for tomorrow's run.
+ * Home matching mirrors the dashboard: the domain(s) sharing the keyword's
+ * checkpoint, narrowed to the exact town when the keyword names one. */
+async function recheckHomeMissing(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const [domains, keywords] = await Promise.all([
+    fetchAllRows<{ domain: string; location: string | null; serp_location: string | null }>((from, to) =>
+      c.supabase
+        .from("tracked_domains")
+        .select("domain, location, serp_location")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+    ),
+    fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
+      c.supabase
+        .from("tracked_keywords")
+        .select("id, keyword, location_name")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+    ),
+  ]);
+  const candidates = domains
+    .map((d) => ({
+      domain: normaliseDomain(d.domain),
+      homeKey: (d.serp_location ?? d.location)?.split(",")[0].trim().toLowerCase() || null,
+      townLower: d.location?.trim().toLowerCase() ?? null,
+    }))
+    .filter((d) => d.homeKey);
+
+  const doomed: string[] = [];
+  for (let i = 0; i < keywords.length; i += 50) {
+    const slice = keywords.slice(i, i + 50);
+    const ids = slice.map((k) => k.id);
+    const [checks, ranked] = await Promise.all([
+      fetchAllRows<{ keyword_id: string }>((from, to) =>
+        c.supabase
+          .from("serp_checks")
+          .select("keyword_id")
+          .eq("check_date", today)
+          .is("error", null)
+          .in("keyword_id", ids)
+          .order("keyword_id")
+          .range(from, to),
+      ),
+      fetchAllRows<{ keyword_id: string; domain: string }>((from, to) =>
+        c.supabase
+          .from("serp_rankings")
+          .select("keyword_id, domain")
+          .eq("check_date", today)
+          .in("keyword_id", ids)
+          .order("id")
+          .range(from, to),
+      ),
+    ]);
+    const checkedToday = new Set(checks.map((r) => r.keyword_id));
+    const rankedBy = new Map<string, Set<string>>();
+    for (const r of ranked) {
+      const set = rankedBy.get(r.keyword_id) ?? new Set<string>();
+      set.add(r.domain);
+      rankedBy.set(r.keyword_id, set);
+    }
+    for (const k of slice) {
+      if (!checkedToday.has(k.id)) continue;
+      const town = k.location_name.split(",")[0].trim().toLowerCase();
+      const atCheckpoint = candidates.filter((d) => d.homeKey === town);
+      const textMatches = atCheckpoint.filter((d) => d.townLower && k.keyword.includes(d.townLower));
+      const homeSet = (textMatches.length > 0 ? textMatches : atCheckpoint).map((d) => d.domain);
+      if (homeSet.length === 0) continue; // no home site to be missing
+      const rankedSet = rankedBy.get(k.id);
+      if (rankedSet && homeSet.some((d) => rankedSet.has(d))) continue; // home ranks
+      doomed.push(k.id);
+    }
+  }
+  for (let i = 0; i < doomed.length; i += 100) {
+    await c.supabase
+      .from("serp_checks")
+      .delete()
+      .eq("check_date", today)
+      .in("keyword_id", doomed.slice(i, i + 100));
+  }
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteDomain(formData: FormData) {
   "use server";
   const c = await caller();
@@ -1207,6 +1297,23 @@ export default async function RankTrackerPage({
                     className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
                   >
                     Retry {failedToday} failed (then press Check rankings now)
+                  </PendingButton>
+                </form>
+              ) : null;
+            })()}
+            {(() => {
+              if (watchedTotal === 0) return null;
+              const homeMissingToday = summarised.filter(
+                (s) => s.hasHome && s.check && !s.check.error && s.check.date === todayStr && !s.home,
+              ).length;
+              return homeMissingToday > 0 ? (
+                <form action={recheckHomeMissing}>
+                  <input type="hidden" name="campaign" value={campaignId} />
+                  <PendingButton
+                    pendingLabel="Unlocking…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Re-check {homeMissingToday} home-missing today (then press Check rankings now)
                   </PendingButton>
                 </form>
               ) : null;
