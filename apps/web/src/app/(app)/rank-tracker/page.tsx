@@ -940,7 +940,7 @@ export default async function RankTrackerPage({
     <div>
       <PageHeader
         title="Rank tracker"
-        subtitle={`${campaign.name} — one SERP check per keyword covers all ${watchedTotal} domains in this campaign at once. Checks run this campaign only; the weekly overnight sweep refreshes every campaign.`}
+        subtitle={`${campaign.name} — one SERP check per keyword covers all ${watchedTotal} domains in this campaign at once. Checks run this campaign only, and only when you press “Check rankings now” — nothing runs on a schedule.`}
       >
         <span className="inline-flex items-center gap-2">
           {keywords.length > 0 && (
