@@ -560,23 +560,22 @@ async function recheckMissingRankings(formData: FormData) {
   const c = await callerCampaign(formData);
   if (!c) return;
   const today = new Date().toISOString().slice(0, 10);
-  const keywordIds = (
-    await fetchAllRows<{ id: string }>((from, to) =>
-      c.supabase
-        .from("tracked_keywords")
-        .select("id")
-        .eq("campaign_id", c.campaignId)
-        .order("id")
-        .range(from, to),
-    )
-  ).map((k) => k.id);
-  for (let i = 0; i < keywordIds.length; i += 50) {
-    const slice = keywordIds.slice(i, i + 50);
+  const keywordRows = await fetchAllRows<{ id: string; location_name: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("id, location_name")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  const locationById = new Map(keywordRows.map((k) => [k.id, k.location_name]));
+  for (let i = 0; i < keywordRows.length; i += 50) {
+    const slice = keywordRows.slice(i, i + 50).map((k) => k.id);
     const [checks, ranked] = await Promise.all([
-      fetchAllRows<{ keyword_id: string }>((from, to) =>
+      fetchAllRows<{ keyword_id: string; organic_count: number | null; search_location: string | null }>((from, to) =>
         c.supabase
           .from("serp_checks")
-          .select("keyword_id")
+          .select("keyword_id, organic_count, search_location")
           .eq("check_date", today)
           .is("error", null)
           .in("keyword_id", slice)
@@ -594,7 +593,18 @@ async function recheckMissingRankings(formData: FormData) {
       ),
     ]);
     const has = new Set(ranked.map((r) => r.keyword_id));
-    const doomed = checks.map((r) => r.keyword_id).filter((id) => !has.has(id));
+    const doomed = checks
+      .filter((r) => {
+        if (has.has(r.keyword_id)) return false;
+        // Same convergence rule as the buttons: a zero on a healthy SERP or
+        // after the fallback is final for today, not re-checkable.
+        const final =
+          r.organic_count !== null &&
+          (r.organic_count >= THIN_SERP_THRESHOLD ||
+            Boolean(r.search_location && r.search_location !== locationById.get(r.keyword_id)));
+        return !final;
+      })
+      .map((r) => r.keyword_id);
     if (doomed.length > 0) {
       await c.supabase
         .from("serp_checks")
@@ -647,10 +657,10 @@ async function recheckHomeMissing(formData: FormData) {
     const slice = keywords.slice(i, i + 50);
     const ids = slice.map((k) => k.id);
     const [checks, ranked] = await Promise.all([
-      fetchAllRows<{ keyword_id: string }>((from, to) =>
+      fetchAllRows<{ keyword_id: string; organic_count: number | null; search_location: string | null }>((from, to) =>
         c.supabase
           .from("serp_checks")
-          .select("keyword_id")
+          .select("keyword_id, organic_count, search_location")
           .eq("check_date", today)
           .is("error", null)
           .in("keyword_id", ids)
@@ -667,7 +677,7 @@ async function recheckHomeMissing(formData: FormData) {
           .range(from, to),
       ),
     ]);
-    const checkedToday = new Set(checks.map((r) => r.keyword_id));
+    const checkedToday = new Map(checks.map((r) => [r.keyword_id, r]));
     const rankedBy = new Map<string, Set<string>>();
     for (const r of ranked) {
       const set = rankedBy.get(r.keyword_id) ?? new Set<string>();
@@ -675,7 +685,15 @@ async function recheckHomeMissing(formData: FormData) {
       rankedBy.set(r.keyword_id, set);
     }
     for (const k of slice) {
-      if (!checkedToday.has(k.id)) continue;
+      const check = checkedToday.get(k.id);
+      if (!check) continue;
+      // A zero on a healthy SERP, or one whose fallback already ran, is
+      // final for today — deleting it would just re-pay for the same answer.
+      const final =
+        check.organic_count !== null &&
+        (check.organic_count >= THIN_SERP_THRESHOLD ||
+          Boolean(check.search_location && check.search_location !== k.location_name));
+      if (final) continue;
       const town = k.location_name.split(",")[0].trim().toLowerCase();
       const atCheckpoint = candidates.filter((d) => d.homeKey === town);
       const textMatches = atCheckpoint.filter((d) => d.townLower && k.keyword.includes(d.townLower));
@@ -1303,8 +1321,22 @@ export default async function RankTrackerPage({
             })()}
             {(() => {
               if (watchedTotal === 0) return null;
+              // A zero is FINAL for today when its SERP was healthy, or the
+              // town/council fallback already ran: re-checking it just pays
+              // to reconfirm. Only artifacts still worth redoing are counted,
+              // so this button converges to zero instead of looping.
+              const finalToday = (s: (typeof summarised)[number]) =>
+                s.check!.organicCount !== null &&
+                (s.check!.organicCount >= THIN_SERP_THRESHOLD ||
+                  Boolean(s.check!.searchLocation && s.check!.searchLocation !== s.k.location_name));
               const homeMissingToday = summarised.filter(
-                (s) => s.hasHome && s.check && !s.check.error && s.check.date === todayStr && !s.home,
+                (s) =>
+                  s.hasHome &&
+                  s.check &&
+                  !s.check.error &&
+                  s.check.date === todayStr &&
+                  !s.home &&
+                  !finalToday(s),
               ).length;
               return homeMissingToday > 0 ? (
                 <form action={recheckHomeMissing}>
@@ -1322,7 +1354,14 @@ export default async function RankTrackerPage({
               if (watchedTotal === 0) return null;
               const missing = keywords.filter((k) => {
                 const check = latestCheck.get(k.id);
-                return check && !check.error && check.date === todayStr && !rankedAnyToday.has(k.id);
+                if (!check || check.error || check.date !== todayStr || rankedAnyToday.has(k.id)) return false;
+                // Skip zeros that are final for today (healthy SERP, or the
+                // fallback already ran) — same convergence rule as above.
+                const final =
+                  check.organicCount !== null &&
+                  (check.organicCount >= THIN_SERP_THRESHOLD ||
+                    Boolean(check.searchLocation && check.searchLocation !== k.location_name));
+                return !final;
               }).length;
               return missing > 0 ? (
                 <form action={recheckMissingRankings}>
