@@ -83,6 +83,24 @@ async function callerCampaign(
     : null;
 }
 
+/** Districts whose campaign domains span more than one town — no safe
+ * town-level fallback exists for their keywords (see the migration guard),
+ * so their thin results count as final. */
+function buildMultiTownDistricts(
+  domains: { location: string | null; serp_location: string | null }[],
+): Set<string> {
+  const towns = new Map<string, Set<string>>();
+  for (const d of domains) {
+    const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
+    const town = d.location?.trim().toLowerCase();
+    if (!pc || !town || !/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) continue;
+    const set = towns.get(pc) ?? new Set<string>();
+    set.add(town);
+    towns.set(pc, set);
+  }
+  return new Set([...towns.entries()].filter(([, s]) => s.size > 1).map(([pc]) => pc));
+}
+
 const titleCase = (s: string) =>
   s
     .split(/\s+/)
@@ -570,6 +588,16 @@ async function recheckMissingRankings(formData: FormData) {
       .range(from, to),
   );
   const locationById = new Map(keywordRows.map((k) => [k.id, k.location_name]));
+  const rrDomains = await fetchAllRows<{ location: string | null; serp_location: string | null }>(
+    (from, to) =>
+      c.supabase
+        .from("tracked_domains")
+        .select("location, serp_location")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+  );
+  const multiTownDistricts = buildMultiTownDistricts(rrDomains);
   for (let i = 0; i < keywordRows.length; i += 50) {
     const slice = keywordRows.slice(i, i + 50).map((k) => k.id);
     const [checks, ranked] = await Promise.all([
@@ -599,10 +627,12 @@ async function recheckMissingRankings(formData: FormData) {
         if (has.has(r.keyword_id)) return false;
         // Same convergence rule as the buttons: a zero on a healthy SERP or
         // after the fallback is final for today, not re-checkable.
+        const loc = locationById.get(r.keyword_id) ?? "";
         const final =
-          r.organic_count !== null &&
-          (r.organic_count >= THIN_SERP_THRESHOLD ||
-            Boolean(r.search_location && r.search_location !== locationById.get(r.keyword_id)));
+          (r.organic_count !== null &&
+            (r.organic_count >= THIN_SERP_THRESHOLD ||
+              Boolean(r.search_location && r.search_location !== loc))) ||
+          multiTownDistricts.has(loc.split(",")[0].trim().toLowerCase());
         return !final;
       })
       .map((r) => r.keyword_id);
@@ -652,6 +682,7 @@ async function recheckHomeMissing(formData: FormData) {
       townLower: d.location?.trim().toLowerCase() ?? null,
     }))
     .filter((d) => d.homeKey);
+  const multiTownDistricts = buildMultiTownDistricts(domains);
 
   const doomed: string[] = [];
   for (let i = 0; i < keywords.length; i += 50) {
@@ -691,9 +722,10 @@ async function recheckHomeMissing(formData: FormData) {
       // A zero on a healthy SERP, or one whose fallback already ran, is
       // final for today — deleting it would just re-pay for the same answer.
       const final =
-        check.organic_count !== null &&
-        (check.organic_count >= THIN_SERP_THRESHOLD ||
-          Boolean(check.search_location && check.search_location !== k.location_name));
+        (check.organic_count !== null &&
+          (check.organic_count >= THIN_SERP_THRESHOLD ||
+            Boolean(check.search_location && check.search_location !== k.location_name))) ||
+        multiTownDistricts.has(k.location_name.split(",")[0].trim().toLowerCase());
       if (final) continue;
       const town = k.location_name.split(",")[0].trim().toLowerCase();
       const atCheckpoint = candidates.filter((d) => d.homeKey === town);
@@ -1081,6 +1113,12 @@ export default async function RankTrackerPage({
     if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) brandSet.add(`${pc} locksmith ${town}`);
   }
 
+  // Districts shared by several towns in this campaign have no safe
+  // town-level fallback (their keywords cannot be split between towns), so
+  // a thin result from one is as good as measurement gets — final, not
+  // re-checkable.
+  const multiTownDistricts = buildMultiTownDistricts(watchDomains);
+
   const townOf = (locationName: string) => locationName.split(",")[0].trim().toLowerCase();
   const summarised = keywords.map((k) => {
     const check = latestCheck.get(k.id) ?? null;
@@ -1372,9 +1410,10 @@ export default async function RankTrackerPage({
               // to reconfirm. Only artifacts still worth redoing are counted,
               // so this button converges to zero instead of looping.
               const finalToday = (s: (typeof summarised)[number]) =>
-                s.check!.organicCount !== null &&
-                (s.check!.organicCount >= THIN_SERP_THRESHOLD ||
-                  Boolean(s.check!.searchLocation && s.check!.searchLocation !== s.k.location_name));
+                (s.check!.organicCount !== null &&
+                  (s.check!.organicCount >= THIN_SERP_THRESHOLD ||
+                    Boolean(s.check!.searchLocation && s.check!.searchLocation !== s.k.location_name))) ||
+                multiTownDistricts.has(s.k.location_name.split(",")[0].trim().toLowerCase());
               const homeMissingToday = summarised.filter(
                 (s) =>
                   s.hasHome &&
@@ -1404,9 +1443,10 @@ export default async function RankTrackerPage({
                 // Skip zeros that are final for today (healthy SERP, or the
                 // fallback already ran) — same convergence rule as above.
                 const final =
-                  check.organicCount !== null &&
-                  (check.organicCount >= THIN_SERP_THRESHOLD ||
-                    Boolean(check.searchLocation && check.searchLocation !== k.location_name));
+                  (check.organicCount !== null &&
+                    (check.organicCount >= THIN_SERP_THRESHOLD ||
+                      Boolean(check.searchLocation && check.searchLocation !== k.location_name))) ||
+                  multiTownDistricts.has(k.location_name.split(",")[0].trim().toLowerCase());
                 return !final;
               }).length;
               return missing > 0 ? (
