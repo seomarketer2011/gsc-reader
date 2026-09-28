@@ -241,7 +241,7 @@ async function generateKeywords(formData: FormData) {
   if (pairs.size === 0) {
     const resolved = resolveLocation(locations, "United Kingdom");
     for (const p of patterns) {
-      if (p.includes("{location}")) continue; // nothing to fill it with
+      if (p.includes("{location}") || p.includes("{postcode}")) continue; // nothing to fill it with
       rows.push({
         ...base,
         keyword: p,
@@ -258,10 +258,21 @@ async function generateKeywords(formData: FormData) {
         locations,
         checkpoint.includes(",") ? checkpoint : `${checkpoint},${suffix}`,
       );
+      // "{postcode}" fills with the checkpoint's postcode district ("CR8" ->
+      // "cr8") — how the network's brand names are built ("cr8 locksmith
+      // purley"). Towns whose checkpoint isn't a district skip such patterns:
+      // there is no brand to word.
+      const pc = checkpoint.split(",")[0].trim().toLowerCase();
+      const hasDistrict = /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc);
       for (const p of patterns) {
+        if (p.includes("{postcode}") && !hasDistrict) continue;
         rows.push({
           ...base,
-          keyword: p.replaceAll("{location}", town.toLowerCase()).replace(/\s+/g, " ").trim(),
+          keyword: p
+            .replaceAll("{postcode}", pc)
+            .replaceAll("{location}", town.toLowerCase())
+            .replace(/\s+/g, " ")
+            .trim(),
           location_name: resolved.name,
           location_valid: resolved.valid,
         });
@@ -797,6 +808,17 @@ export default async function RankTrackerPage({
   // sister site sharing the postcode (Finsbury Park, also N4) counts as
   // overlap there, while generic keywords ("locksmith near me") keep every
   // site at that checkpoint as home.
+  // Branded terms: "{postcode} locksmith {town}" for each imported domain —
+  // the network's business-name pattern. Derived from the domain list, so
+  // keywords generated with the {postcode} pattern are recognised without
+  // any per-keyword tagging.
+  const brandSet = new Set<string>();
+  for (const w of watchDomains) {
+    const pc = w.serp_location?.split(",")[0].trim().toLowerCase();
+    const town = w.location?.trim().toLowerCase();
+    if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) brandSet.add(`${pc} locksmith ${town}`);
+  }
+
   const townOf = (locationName: string) => locationName.split(",")[0].trim().toLowerCase();
   const summarised = keywords.map((k) => {
     const check = latestCheck.get(k.id) ?? null;
@@ -809,7 +831,17 @@ export default async function RankTrackerPage({
     const homeSet = new Set((textMatches.length > 0 ? textMatches : candidates).map(([d]) => d));
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && watched.get(r.domain)?.homeKey);
-    return { k, check, ranked, town, hasHome: homeSet.size > 0, homeSet, home, overlap };
+    return {
+      k,
+      check,
+      ranked,
+      town,
+      hasHome: homeSet.size > 0,
+      homeSet,
+      home,
+      overlap,
+      branded: brandSet.has(k.keyword),
+    };
   });
 
   // The text filter narrows EVERYTHING — stat tiles and view counts included —
@@ -830,6 +862,7 @@ export default async function RankTrackerPage({
     if (view === "missing") return s.hasHome && s.check && !s.check.error && !s.home;
     if (view === "overlap") return s.overlap.length > 0;
     if (view === "failed") return Boolean(s.check?.error);
+    if (view === "branded") return s.branded;
     return true;
   });
   // Order: keywords come A–Z from the query; position sorts put #1s first
@@ -1037,6 +1070,7 @@ export default async function RankTrackerPage({
             {viewLink("all", "All", summarised.length)}
             {viewLink("missing", "Home site missing", homeMissing)}
             {viewLink("overlap", "Overlap", overlapRows)}
+            {brandSet.size > 0 && viewLink("branded", "Branded", qFiltered.filter((s) => s.branded).length)}
             {viewLink("failed", "Failed checks", summarised.filter((s) => s.check?.error).length)}
             {(() => {
               const failedToday = checks.filter((r) => r.error && r.check_date === todayStr).length;
@@ -1411,7 +1445,7 @@ export default async function RankTrackerPage({
               name="patterns"
               required
               rows={6}
-              placeholder={"One pattern per line — {location} becomes each town:\nlocksmith {location}\nemergency locksmith {location}\nlock repairs {location}\nlocksmith near me\n24 hour locksmith"}
+              placeholder={"One pattern per line — {location} becomes each town, {postcode} its district:\nlocksmith {location}\nlocksmith in {location}\nemergency locksmith {location}\n{postcode} locksmith {location}\nlocksmith near me"}
               className={`${input} w-full font-mono text-xs`}
               aria-label="Keyword patterns, one per line"
             />
@@ -1431,7 +1465,8 @@ export default async function RankTrackerPage({
               Every pattern is generated for every town in this campaign and checked FROM that town
               — “near me” style patterns too. 5 patterns × 292 towns = 1,460 keywords (~$3 per full
               run); 5 patterns × 1 town = 5 keywords (a penny or two). Existing keywords are never
-              duplicated.
+              duplicated. “{"{postcode}"} locksmith {"{location}"}” builds each site&rsquo;s brand
+              name (“cr8 locksmith purley”) — those show under the <b>Branded</b> view above.
             </p>
           </form>
           <details className="mt-3 text-xs text-ink-2">

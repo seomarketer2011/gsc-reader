@@ -121,6 +121,15 @@ export async function GET(request: NextRequest) {
     rankedBy.set(r.keyword_id, list);
   }
 
+  // Branded terms: "{postcode} locksmith {town}" per imported domain — the
+  // network's business-name pattern, same derivation as the dashboard.
+  const brandSet = new Set<string>();
+  for (const d of domains) {
+    const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
+    const town = d.location?.trim().toLowerCase();
+    if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) brandSet.add(`${pc} locksmith ${town}`);
+  }
+
   // homeKey matches domains to keywords checked from their checkpoint
   // (serp_location when set, town otherwise); label is for display.
   const homeKey = new Map<string, string>();
@@ -166,6 +175,7 @@ export async function GET(request: NextRequest) {
     if (view === "missing") return s.hasHome && s.check && !s.check.error && !s.home;
     if (view === "overlap") return s.overlap.length > 0;
     if (view === "failed") return Boolean(s.check?.error);
+    if (view === "branded") return brandSet.has(s.k.keyword);
     return true;
   });
   if (sort === "best") {
