@@ -520,20 +520,38 @@ export async function collectSerpResults(
       .eq("check_date", today);
   }
   const writableRankings = rankingRows.filter((r) => !unwritten.has(r.keyword_id as string));
+  const rankingsFailed = new Set<string>();
   for (let i = 0; i < writableRankings.length; i += CHUNK) {
-    const { error } = await service.from("serp_rankings").insert(writableRankings.slice(i, i + CHUNK));
-    if (error) console.error("serp collect: rankings insert failed:", error.message);
+    const slice = writableRankings.slice(i, i + CHUNK);
+    const { error } = await service.from("serp_rankings").insert(slice);
+    if (error) {
+      console.error("serp collect: rankings insert failed:", error.message);
+      for (const r of slice) rankingsFailed.add(r.keyword_id as string);
+    }
+  }
+  // A check whose rankings failed to write reads as "nothing ranks" — worse
+  // than no check at all, and it blocks a re-run for the rest of the day.
+  // Undo those checks and keep their queue rows so next pass redoes them.
+  if (rankingsFailed.size > 0) {
+    const ids = [...rankingsFailed];
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      await service
+        .from("serp_checks")
+        .delete()
+        .in("keyword_id", ids.slice(i, i + CHUNK))
+        .eq("check_date", today);
+    }
   }
   // Clear ALL processed queue rows (including a double-post's extra row);
   // synthetic orphan rows have no database id to delete.
   const doneRowIds = [...successes, ...failures]
-    .filter((s) => s.row.id && !unwritten.has(s.row.keyword_id))
+    .filter((s) => s.row.id && !unwritten.has(s.row.keyword_id) && !rankingsFailed.has(s.row.keyword_id))
     .map((s) => s.row.id);
   for (let i = 0; i < doneRowIds.length; i += CHUNK) {
     await service.from("serp_task_queue").delete().in("id", doneRowIds.slice(i, i + CHUNK));
   }
 
-  const collected = successIds.length;
+  const collected = successIds.filter((id) => !rankingsFailed.has(id)).length;
   const failedWritten = uniqueFailures.filter((f) => !unwritten.has(f.row.keyword_id)).length;
   const remaining = Math.max(0, queue.length - doneRowIds.length);
   console.log(
@@ -547,10 +565,18 @@ export async function getWatchedDomains(
   service: SupabaseClient,
   orgId: string,
 ): Promise<WatchedDomain[]> {
-  const [{ data: sites }, { data: watch }] = await Promise.all([
+  const [sitesRes, watchRes] = await Promise.all([
     service.from("sites").select("id, domain").eq("organisation_id", orgId),
     service.from("tracked_domains").select("domain").eq("organisation_id", orgId),
   ]);
+  // A failed query MUST abort the caller. Collecting against a silently
+  // empty watch list stores every keyword as "checked, nothing ranks" —
+  // wrong data that blocks re-checking for the rest of the day. No watch
+  // list, no collection; the task queue keeps the results for next pass.
+  if (sitesRes.error) throw new Error(`watched domains: sites query failed: ${sitesRes.error.message}`);
+  if (watchRes.error) throw new Error(`watched domains: tracked_domains query failed: ${watchRes.error.message}`);
+  const { data: sites } = sitesRes;
+  const { data: watch } = watchRes;
   const out = new Map<string, WatchedDomain>();
   for (const s of sites ?? []) {
     out.set(normaliseDomain(s.domain as string), {

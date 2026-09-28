@@ -439,6 +439,62 @@ async function retryFailedChecks(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/** Deletes today's ranking-less checks for this campaign so "Check rankings
+ * now" redoes them — the recovery for a collection pass whose watch-list
+ * lookup or rankings write failed, which stores every keyword as "checked,
+ * nothing ranks" with no error to retry by. For a campaign that watches
+ * domains, re-checking a genuinely all-absent SERP merely reconfirms it. */
+async function recheckMissingRankings(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const keywordIds = (
+    await fetchAllRows<{ id: string }>((from, to) =>
+      c.supabase
+        .from("tracked_keywords")
+        .select("id")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+    )
+  ).map((k) => k.id);
+  for (let i = 0; i < keywordIds.length; i += 50) {
+    const slice = keywordIds.slice(i, i + 50);
+    const [checks, ranked] = await Promise.all([
+      fetchAllRows<{ keyword_id: string }>((from, to) =>
+        c.supabase
+          .from("serp_checks")
+          .select("keyword_id")
+          .eq("check_date", today)
+          .is("error", null)
+          .in("keyword_id", slice)
+          .order("keyword_id")
+          .range(from, to),
+      ),
+      fetchAllRows<{ keyword_id: string }>((from, to) =>
+        c.supabase
+          .from("serp_rankings")
+          .select("keyword_id")
+          .eq("check_date", today)
+          .in("keyword_id", slice)
+          .order("id")
+          .range(from, to),
+      ),
+    ]);
+    const has = new Set(ranked.map((r) => r.keyword_id));
+    const doomed = checks.map((r) => r.keyword_id).filter((id) => !has.has(id));
+    if (doomed.length > 0) {
+      await c.supabase
+        .from("serp_checks")
+        .delete()
+        .eq("check_date", today)
+        .in("keyword_id", doomed);
+    }
+  }
+  revalidatePath("/rank-tracker");
+}
+
 async function deleteDomain(formData: FormData) {
   "use server";
   const c = await caller();
@@ -713,7 +769,13 @@ export default async function RankTrackerPage({
     : [];
   const rankingsByKeyword = new Map<string, { domain: string; position: number; url: string }[]>();
   const prevPosition = new Map<string, number>(); // "keywordId|domain" -> previous position
+  // Keywords with at least one ranking row TODAY, for any org domain. A
+  // successful check today with no rankings at all is the signature of a
+  // collection pass whose rankings write failed — surfaced as a repair
+  // button below.
+  const rankedAnyToday = new Set<string>();
   for (const r of rankings) {
+    if (r.check_date === todayStr) rankedAnyToday.add(r.keyword_id);
     // Rankings are recorded for every domain the organisation watches, so a
     // sister campaign's domains show up here — this campaign only cares
     // about its own.
@@ -986,6 +1048,24 @@ export default async function RankTrackerPage({
                     className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
                   >
                     Retry {failedToday} failed (then press Check rankings now)
+                  </PendingButton>
+                </form>
+              ) : null;
+            })()}
+            {(() => {
+              if (watchedTotal === 0) return null;
+              const missing = keywords.filter((k) => {
+                const check = latestCheck.get(k.id);
+                return check && !check.error && check.date === todayStr && !rankedAnyToday.has(k.id);
+              }).length;
+              return missing > 0 ? (
+                <form action={recheckMissingRankings}>
+                  <input type="hidden" name="campaign" value={campaignId} />
+                  <PendingButton
+                    pendingLabel="Unlocking…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Re-check {missing} with no rankings recorded (then press Check rankings now)
                   </PendingButton>
                 </form>
               ) : null;
