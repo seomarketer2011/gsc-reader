@@ -1,7 +1,8 @@
 // Cloudflare DNS — server-only helpers for the network-connect flow.
-// Uses the account's Global API Key (CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY
-// Worker secrets); zones are scoped to CLOUDFLARE_ACCOUNT_ID so a key with
-// access to more than one account still only sees the network's zones.
+// Uses the Global API Key (CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY Worker
+// secrets). The network is spread across hundreds of per-site Cloudflare
+// accounts that this key can all reach, so zones are deliberately listed
+// WITHOUT an account filter — every zone the key can see is the network.
 
 const API = "https://api.cloudflare.com/client/v4";
 
@@ -12,11 +13,7 @@ export interface CfZone {
 }
 
 export function cloudflareConfigured(): boolean {
-  return Boolean(
-    process.env.CLOUDFLARE_EMAIL &&
-      process.env.CLOUDFLARE_API_KEY &&
-      process.env.CLOUDFLARE_ACCOUNT_ID,
-  );
+  return Boolean(process.env.CLOUDFLARE_EMAIL && process.env.CLOUDFLARE_API_KEY);
 }
 
 function headers(): Record<string, string> {
@@ -43,15 +40,13 @@ async function cfJson<T>(url: string, init?: RequestInit): Promise<T> {
   return data.result;
 }
 
-/** Every active zone on the account, paged. */
+/** Every active zone this key can reach, across all its accounts, paged. */
 export async function listZones(): Promise<CfZone[]> {
-  const account = process.env.CLOUDFLARE_ACCOUNT_ID!;
   const zones: CfZone[] = [];
   for (let page = 1; ; page++) {
-    const res = await fetch(
-      `${API}/zones?account.id=${account}&status=active&per_page=100&page=${page}`,
-      { headers: headers() },
-    );
+    const res = await fetch(`${API}/zones?status=active&per_page=100&page=${page}`, {
+      headers: headers(),
+    });
     const data = (await res.json()) as {
       success: boolean;
       errors?: { message: string }[];
