@@ -169,7 +169,16 @@ export async function GET(request: NextRequest) {
     const check = latest.get(k.id) ?? null;
     const town = k.location_name.split(",")[0].trim().toLowerCase();
     const ranked = (rankedBy.get(k.id) ?? []).sort((a, b) => a.position - b.position);
-    const candidates = [...homeKey.entries()].filter(([, key]) => key === town).map(([d]) => d);
+    let candidates = [...homeKey.entries()]
+      .filter(([d, key]) => key === town || homeTownLower.get(d) === town)
+      .map(([d]) => d);
+    if (candidates.length === 0) {
+      // Location upgraded to a borough no domain carries — match by the town
+      // named in the keyword text, longest name winning.
+      const textAll = [...homeTownLower.entries()].filter(([, t]) => k.keyword.includes(t));
+      const maxLen = Math.max(0, ...textAll.map(([, t]) => t.length));
+      candidates = textAll.filter(([, t]) => t.length === maxLen).map(([d]) => d);
+    }
     const textMatches = candidates.filter((d) => {
       const t = homeTownLower.get(d);
       return t && k.keyword.includes(t);

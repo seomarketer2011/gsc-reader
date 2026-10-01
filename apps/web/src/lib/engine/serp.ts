@@ -174,6 +174,48 @@ async function lookupOutcode(outcode: string): Promise<OutcodeInfo | null> {
   return info;
 }
 
+const placeCache = new Map<string, string[]>();
+
+/** The borough/council the TOWN itself belongs to, from the OS place
+ * records (postcodes.io /places) — more accurate than the district's
+ * first-listed council when a district straddles several (SE19 touches
+ * four; Upper Norwood is Croydon's). `hints` (the outcode's councils and
+ * region) narrow same-named places. Cached per instance. */
+async function lookupPlaceBoroughs(town: string, hints: string[]): Promise<string[]> {
+  const key = `${town.toLowerCase()}|${hints.join("|")}`;
+  if (placeCache.has(key)) return placeCache.get(key)!;
+  let out: string[] = [];
+  try {
+    const res = await fetch(`https://api.postcodes.io/places?q=${encodeURIComponent(town)}&limit=10`);
+    if (res.ok) {
+      const data = (await res.json()) as {
+        result?: { name_1?: string; county_unitary?: string | null; district_borough?: string | null; region?: string | null }[];
+      };
+      const exact = (data.result ?? []).filter(
+        (p) => (p.name_1 ?? "").toLowerCase() === town.toLowerCase(),
+      );
+      const hinted = hints.length
+        ? exact.filter((p) =>
+            [p.county_unitary, p.district_borough, p.region]
+              .filter((v): v is string => Boolean(v))
+              .some((v) => hints.some((h) => v.toLowerCase().includes(h) || h.includes(v.toLowerCase()))),
+          )
+        : exact;
+      out = [
+        ...new Set(
+          (hinted.length ? hinted : exact).flatMap((p) =>
+            [p.district_borough, p.county_unitary].filter((v): v is string => Boolean(v)),
+          ),
+        ),
+      ];
+    }
+  } catch {
+    // place lookup is best-effort; callers fall through to outcode councils
+  }
+  placeCache.set(key, out);
+  return out;
+}
+
 /**
  * Resolves a town to the most realistic geo-target available, using the
  * domain's postcode district to break ties and to stand in for towns the
@@ -181,8 +223,8 @@ async function lookupOutcode(outcode: string): Promise<OutcodeInfo | null> {
  *   1. the town itself (borough forms resolve automatically);
  *   2. an AMBIGUOUS town: the alternative whose region matches the
  *      district's council/region (Richmond + TW9 -> the Greater London one);
- *   3. an UNLISTED town: the district's council area (SE19 -> Croydon),
- *      which Google resolves confidently, unlike the district itself.
+ *   3. an UNLISTED town: the borough the town's own place record names
+ *      (Upper Norwood -> Croydon), then the district's councils in order.
  * Returns null when nothing resolves — callers keep the district.
  */
 export async function resolveTownForDistrict(
@@ -193,15 +235,19 @@ export async function resolveTownForDistrict(
   const first = resolveLocation(index, town);
   if (first.valid) return first.name;
   const info = outcode ? await lookupOutcode(outcode) : null;
-  if (first.alternatives.length > 0 && info) {
-    const hints = [...info.adminDistricts, info.region ?? ""]
-      .filter(Boolean)
-      .map((h) => h.toLowerCase());
+  const hints = info
+    ? [...info.adminDistricts, info.region ?? ""].filter(Boolean).map((h) => h.toLowerCase())
+    : [];
+  if (first.alternatives.length > 0 && hints.length > 0) {
     const matches = first.alternatives.filter((alt) => {
       const rest = alt.toLowerCase().split(",").slice(1).join(",");
       return hints.some((h) => rest.includes(h));
     });
     if (matches.length === 1) return matches[0];
+  }
+  for (const borough of await lookupPlaceBoroughs(town, hints)) {
+    const r = resolveLocation(index, borough);
+    if (r.valid) return r.name;
   }
   if (info) {
     for (const council of info.adminDistricts) {
@@ -557,18 +603,24 @@ export async function collectSerpResults(
   const fallbackKeywords = new Set<string>();
   const organicCount = (items: SerpItem[]) =>
     items.filter((i) => i.type === "organic" && i.domain).length;
+  // Keyword rows for everything collected — the thin-SERP fallback needs
+  // them, and so does persisting a healthy fallback location below.
+  const kwById = new Map<string, TrackedKeyword>();
+  try {
+    const allIds = uniqueSuccesses.map((s) => s.row.keyword_id);
+    for (let i = 0; i < allIds.length; i += 100) {
+      const { data } = await service
+        .from("tracked_keywords")
+        .select("id, keyword, location_name")
+        .in("id", allIds.slice(i, i + 100));
+      for (const k of (data ?? []) as TrackedKeyword[]) kwById.set(k.id, k);
+    }
+  } catch (e) {
+    console.error("serp collect: keyword rows load failed:", e instanceof Error ? e.message : e);
+  }
   const thinPrimary = uniqueSuccesses.filter((s) => organicCount(s.items) < THIN_SERP_THRESHOLD);
-  if (thinPrimary.length > 0) {
+  if (thinPrimary.length > 0 && kwById.size > 0) {
     try {
-      const ids = thinPrimary.map((s) => s.row.keyword_id);
-      const kwById = new Map<string, TrackedKeyword>();
-      for (let i = 0; i < ids.length; i += 100) {
-        const { data } = await service
-          .from("tracked_keywords")
-          .select("id, keyword, location_name")
-          .in("id", ids.slice(i, i + 100));
-        for (const k of (data ?? []) as TrackedKeyword[]) kwById.set(k.id, k);
-      }
       // District -> every campaign town that shares it. A keyword on a
       // SHARED district still falls back when its own town is readable from
       // the keyword text ("locksmith plaistow" on BR1 -> Plaistow); only
@@ -730,6 +782,27 @@ export async function collectSerpResults(
         .eq("check_date", today);
     }
   }
+  // A healthy result fetched from a FALLBACK location becomes the keyword's
+  // stored location: future runs then check the town directly — one check,
+  // the SERP real searchers see — instead of re-paying a thin district
+  // check plus a fallback every run. A unique collision (the same keyword
+  // already tracked at that location) just keeps the old location.
+  let persisted = 0;
+  for (const s of uniqueSuccesses) {
+    if (unwritten.has(s.row.keyword_id) || rankingsFailed.has(s.row.keyword_id)) continue;
+    const kw = kwById.get(s.row.keyword_id);
+    if (!kw || !s.postedLocation || s.postedLocation === kw.location_name) continue;
+    if (organicCount(s.items) < THIN_SERP_THRESHOLD) continue;
+    const { error } = await service
+      .from("tracked_keywords")
+      .update({ location_name: s.postedLocation, location_valid: true })
+      .eq("id", s.row.keyword_id);
+    if (!error) persisted++;
+  }
+  if (persisted > 0) {
+    console.log(`serp collect: persisted ${persisted} fallback location(s) onto their keywords`);
+  }
+
   // Clear ALL processed queue rows (including a double-post's extra row);
   // synthetic orphan rows have no database id to delete. A keyword whose
   // fallback was just posted keeps its queue row — the upsert re-pointed it

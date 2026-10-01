@@ -533,8 +533,71 @@ async function migrateCheckpointsToTowns(formData: FormData) {
       }
     }
   }
+  // Phase 2 — SHARED districts migrate per KEYWORD: each generated keyword
+  // names its own town, so it gets that town's geo-target individually
+  // while siblings on the same district get theirs. Keywords naming no
+  // town (or several) keep the district.
+  const districtTowns2 = buildDistrictTowns(domains);
+  const kwRows2 = await fetchAllRows<{ id: string; keyword: string; location_name: string }>(
+    (from, to) =>
+      c.supabase
+        .from("tracked_keywords")
+        .select("id, keyword, location_name")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+  );
+  const resolveCache = new Map<string, string | null>();
+  const renameGroups = new Map<string, string[]>();
+  for (const k of kwRows2) {
+    const district = k.location_name.split(",")[0].trim().toLowerCase();
+    if (!/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(district)) continue;
+    const towns = districtTowns2.get(district) ?? [];
+    let town: string | null = towns.length === 1 ? towns[0] : null;
+    if (!town && towns.length > 1) {
+      const text = k.keyword.toLowerCase();
+      const m = towns.filter((t) => text.includes(t));
+      const maxLen = Math.max(0, ...m.map((t) => t.length));
+      const mm = m.filter((t) => t.length === maxLen);
+      if (mm.length === 1) town = mm[0];
+    }
+    if (!town) continue;
+    const cacheKey = `${district}|${town}`;
+    if (!resolveCache.has(cacheKey)) {
+      resolveCache.set(cacheKey, await resolveTownForDistrict(locations, town, district));
+    }
+    const name = resolveCache.get(cacheKey);
+    if (!name || name === k.location_name) continue;
+    const list = renameGroups.get(name) ?? [];
+    list.push(k.id);
+    renameGroups.set(name, list);
+  }
+  let kwMigrated = 0;
+  for (const [name, ids] of renameGroups) {
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const { error } = await c.supabase
+        .from("tracked_keywords")
+        .update({ location_name: name, location_valid: true })
+        .in("id", chunk);
+      if (!error) {
+        kwMigrated += chunk.length;
+        continue;
+      }
+      // A unique collision inside the chunk — move what moves, row by row.
+      for (const id of chunk) {
+        const { error: e2 } = await c.supabase
+          .from("tracked_keywords")
+          .update({ location_name: name, location_valid: true })
+          .eq("id", id);
+        if (!e2) kwMigrated++;
+      }
+    }
+  }
   revalidatePath("/rank-tracker");
-  redirect(`/rank-tracker?campaign=${c.campaignId}&migrated=${migrated}&unchanged=${unchanged}`);
+  redirect(
+    `/rank-tracker?campaign=${c.campaignId}&migrated=${migrated}&kwmigrated=${kwMigrated}&unchanged=${unchanged}`,
+  );
 }
 
 async function deleteKeyword(formData: FormData) {
@@ -744,7 +807,12 @@ async function recheckHomeMissing(formData: FormData) {
         unsplittableOnDistrict(districtTownsHM, k.keyword, k.location_name);
       if (final) continue;
       const town = k.location_name.split(",")[0].trim().toLowerCase();
-      const atCheckpoint = candidates.filter((d) => d.homeKey === town);
+      let atCheckpoint = candidates.filter((d) => d.homeKey === town || d.townLower === town);
+      if (atCheckpoint.length === 0) {
+        const textAll = candidates.filter((d) => d.townLower && k.keyword.includes(d.townLower));
+        const maxLen = Math.max(0, ...textAll.map((d) => d.townLower!.length));
+        atCheckpoint = textAll.filter((d) => d.townLower!.length === maxLen);
+      }
       const textMatches = atCheckpoint.filter((d) => d.townLower && k.keyword.includes(d.townLower));
       const homeSet = (textMatches.length > 0 ? textMatches : atCheckpoint).map((d) => d.domain);
       if (homeSet.length === 0) continue; // no home site to be missing
@@ -1140,7 +1208,19 @@ export default async function RankTrackerPage({
     const check = latestCheck.get(k.id) ?? null;
     const ranked = rankingsByKeyword.get(k.id) ?? [];
     const town = townOf(k.location_name);
-    const candidates = [...watched.entries()].filter(([, w]) => w.homeKey === town);
+    let candidates = [...watched.entries()].filter(
+      ([, w]) => w.homeKey === town || w.homeTownLower === town,
+    );
+    if (candidates.length === 0) {
+      // The keyword's location was upgraded to a borough no domain carries —
+      // match by the town named in the keyword text, longest name winning
+      // ("bromley common" beats "bromley").
+      const textAll = [...watched.entries()].filter(
+        ([, w]) => w.homeTownLower && k.keyword.includes(w.homeTownLower),
+      );
+      const maxLen = Math.max(0, ...textAll.map(([, w]) => w.homeTownLower!.length));
+      candidates = textAll.filter(([, w]) => w.homeTownLower!.length === maxLen);
+    }
     const textMatches = candidates.filter(
       ([, w]) => w.homeTownLower && k.keyword.includes(w.homeTownLower),
     );
@@ -1295,11 +1375,14 @@ export default async function RankTrackerPage({
       {typeof params.migrated === "string" && (
         <Card className="mb-4 border-good/40 p-3 text-sm text-ink">
           <span className="font-medium">Checkpoints migrated:</span>{" "}
-          <span className="tnum">{params.migrated}</span> domains now check from town-level
-          locations ({typeof params.unchanged === "string" ? params.unchanged : 0} unchanged —
-          already town-level or no resolvable town), and their keywords moved with them. Keywords
-          not yet checked today pick the new locations up on the next “Check rankings now”;
-          keywords already checked today re-check under them from tomorrow.
+          <span className="tnum">{params.migrated}</span> domains and{" "}
+          <span className="tnum">
+            {typeof params.kwmigrated === "string" ? params.kwmigrated : 0}
+          </span>{" "}
+          keywords now use town-level geo-targets ({typeof params.unchanged === "string" ? params.unchanged : 0}{" "}
+          domains unchanged — already town-level, shared by several towns, or no resolvable town).
+          Keywords not yet checked today pick the new locations up on the next “Check rankings
+          now”; keywords already checked today re-check under them from tomorrow.
         </Card>
       )}
 
