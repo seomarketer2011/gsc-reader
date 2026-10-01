@@ -83,12 +83,10 @@ async function callerCampaign(
     : null;
 }
 
-/** Districts whose campaign domains span more than one town — no safe
- * town-level fallback exists for their keywords (see the migration guard),
- * so their thin results count as final. */
-function buildMultiTownDistricts(
+/** District (lowercased) -> the campaign towns (lowercased) sharing it. */
+function buildDistrictTowns(
   domains: { location: string | null; serp_location: string | null }[],
-): Set<string> {
+): Map<string, string[]> {
   const towns = new Map<string, Set<string>>();
   for (const d of domains) {
     const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
@@ -98,7 +96,24 @@ function buildMultiTownDistricts(
     set.add(town);
     towns.set(pc, set);
   }
-  return new Set([...towns.entries()].filter(([, s]) => s.size > 1).map(([pc]) => pc));
+  return new Map([...towns.entries()].map(([pc, s]) => [pc, [...s]]));
+}
+
+/** True when a keyword sits on a district shared by several towns AND its
+ * own town cannot be read from the keyword text — the collection fallback
+ * then has no safe town to use, so a thin result is final. Keywords naming
+ * exactly one of the district's towns fall back per keyword and stay
+ * re-checkable. */
+function unsplittableOnDistrict(
+  districtTowns: Map<string, string[]>,
+  keyword: string,
+  locationName: string,
+): boolean {
+  const district = locationName.split(",")[0].trim().toLowerCase();
+  const towns = districtTowns.get(district);
+  if (!towns || towns.length <= 1) return false;
+  const text = keyword.toLowerCase();
+  return towns.filter((t) => text.includes(t)).length !== 1;
 }
 
 const titleCase = (s: string) =>
@@ -579,15 +594,15 @@ async function recheckMissingRankings(formData: FormData) {
   const c = await callerCampaign(formData);
   if (!c) return;
   const today = new Date().toISOString().slice(0, 10);
-  const keywordRows = await fetchAllRows<{ id: string; location_name: string }>((from, to) =>
+  const keywordRows = await fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
     c.supabase
       .from("tracked_keywords")
-      .select("id, location_name")
+      .select("id, keyword, location_name")
       .eq("campaign_id", c.campaignId)
       .order("id")
       .range(from, to),
   );
-  const locationById = new Map(keywordRows.map((k) => [k.id, k.location_name]));
+  const kwRowById = new Map(keywordRows.map((k) => [k.id, k]));
   const rrDomains = await fetchAllRows<{ location: string | null; serp_location: string | null }>(
     (from, to) =>
       c.supabase
@@ -597,7 +612,7 @@ async function recheckMissingRankings(formData: FormData) {
         .order("id")
         .range(from, to),
   );
-  const multiTownDistricts = buildMultiTownDistricts(rrDomains);
+  const districtTownsRR = buildDistrictTowns(rrDomains);
   for (let i = 0; i < keywordRows.length; i += 50) {
     const slice = keywordRows.slice(i, i + 50).map((k) => k.id);
     const [checks, ranked] = await Promise.all([
@@ -627,12 +642,13 @@ async function recheckMissingRankings(formData: FormData) {
         if (has.has(r.keyword_id)) return false;
         // Same convergence rule as the buttons: a zero on a healthy SERP or
         // after the fallback is final for today, not re-checkable.
-        const loc = locationById.get(r.keyword_id) ?? "";
+        const kwRow = kwRowById.get(r.keyword_id);
+        const loc = kwRow?.location_name ?? "";
         const final =
           (r.organic_count !== null &&
             (r.organic_count >= THIN_SERP_THRESHOLD ||
               Boolean(r.search_location && r.search_location !== loc))) ||
-          multiTownDistricts.has(loc.split(",")[0].trim().toLowerCase());
+          unsplittableOnDistrict(districtTownsRR, kwRow?.keyword ?? "", loc);
         return !final;
       })
       .map((r) => r.keyword_id);
@@ -682,7 +698,7 @@ async function recheckHomeMissing(formData: FormData) {
       townLower: d.location?.trim().toLowerCase() ?? null,
     }))
     .filter((d) => d.homeKey);
-  const multiTownDistricts = buildMultiTownDistricts(domains);
+  const districtTownsHM = buildDistrictTowns(domains);
 
   const doomed: string[] = [];
   for (let i = 0; i < keywords.length; i += 50) {
@@ -725,7 +741,7 @@ async function recheckHomeMissing(formData: FormData) {
         (check.organic_count !== null &&
           (check.organic_count >= THIN_SERP_THRESHOLD ||
             Boolean(check.search_location && check.search_location !== k.location_name))) ||
-        multiTownDistricts.has(k.location_name.split(",")[0].trim().toLowerCase());
+        unsplittableOnDistrict(districtTownsHM, k.keyword, k.location_name);
       if (final) continue;
       const town = k.location_name.split(",")[0].trim().toLowerCase();
       const atCheckpoint = candidates.filter((d) => d.homeKey === town);
@@ -1117,7 +1133,7 @@ export default async function RankTrackerPage({
   // town-level fallback (their keywords cannot be split between towns), so
   // a thin result from one is as good as measurement gets — final, not
   // re-checkable.
-  const multiTownDistricts = buildMultiTownDistricts(watchDomains);
+  const districtTowns = buildDistrictTowns(watchDomains);
 
   const townOf = (locationName: string) => locationName.split(",")[0].trim().toLowerCase();
   const summarised = keywords.map((k) => {
@@ -1413,7 +1429,7 @@ export default async function RankTrackerPage({
                 (s.check!.organicCount !== null &&
                   (s.check!.organicCount >= THIN_SERP_THRESHOLD ||
                     Boolean(s.check!.searchLocation && s.check!.searchLocation !== s.k.location_name))) ||
-                multiTownDistricts.has(s.k.location_name.split(",")[0].trim().toLowerCase());
+                unsplittableOnDistrict(districtTowns, s.k.keyword, s.k.location_name);
               const homeMissingToday = summarised.filter(
                 (s) =>
                   s.hasHome &&
@@ -1446,7 +1462,7 @@ export default async function RankTrackerPage({
                   (check.organicCount !== null &&
                     (check.organicCount >= THIN_SERP_THRESHOLD ||
                       Boolean(check.searchLocation && check.searchLocation !== k.location_name))) ||
-                  multiTownDistricts.has(k.location_name.split(",")[0].trim().toLowerCase());
+                  unsplittableOnDistrict(districtTowns, k.keyword, k.location_name);
                 return !final;
               }).length;
               return missing > 0 ? (

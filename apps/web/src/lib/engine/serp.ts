@@ -569,9 +569,11 @@ export async function collectSerpResults(
           .in("id", ids.slice(i, i + 100));
         for (const k of (data ?? []) as TrackedKeyword[]) kwById.set(k.id, k);
       }
-      // District -> its town; null marks a district shared by DIFFERENT
-      // towns, where a single fallback location cannot be trusted.
-      const townByDistrict = new Map<string, string | null>();
+      // District -> every campaign town that shares it. A keyword on a
+      // SHARED district still falls back when its own town is readable from
+      // the keyword text ("locksmith plaistow" on BR1 -> Plaistow); only
+      // keywords naming no town (or several) keep the district result.
+      const townsByDistrict = new Map<string, string[]>();
       for (let from = 0; ; from += QUEUE_PAGE) {
         const { data } = await service
           .from("tracked_domains")
@@ -583,11 +585,9 @@ export async function collectSerpResults(
           const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
           const town = d.location?.trim();
           if (!pc || !town || !/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) continue;
-          const existing = townByDistrict.get(pc);
-          if (existing === undefined) townByDistrict.set(pc, town);
-          else if (existing !== null && existing.toLowerCase() !== town.toLowerCase()) {
-            townByDistrict.set(pc, null);
-          }
+          const list = townsByDistrict.get(pc) ?? [];
+          if (!list.some((t) => t.toLowerCase() === town.toLowerCase())) list.push(town);
+          townsByDistrict.set(pc, list);
         }
         if (!data || data.length < QUEUE_PAGE) break;
       }
@@ -599,7 +599,13 @@ export async function collectSerpResults(
         if (s.postedLocation && s.postedLocation !== kw.location_name) continue; // already the fallback
         const district = kw.location_name.split(",")[0].trim().toLowerCase();
         if (!/^[a-z]{1,2}\d{1,2}[a-z]?$/.test(district)) continue; // not a district checkpoint
-        const town = townByDistrict.get(district);
+        const towns = townsByDistrict.get(district) ?? [];
+        let town: string | null = towns.length === 1 ? towns[0] : null;
+        if (!town && towns.length > 1) {
+          const text = kw.keyword.toLowerCase();
+          const matches = towns.filter((t) => text.includes(t.toLowerCase()));
+          if (matches.length === 1) town = matches[0];
+        }
         if (!town) continue;
         const name = await resolveTownForDistrict(locations, town, district);
         if (!name || name === kw.location_name) continue;
