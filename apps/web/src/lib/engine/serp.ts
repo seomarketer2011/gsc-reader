@@ -802,13 +802,17 @@ export async function collectSerpResults(
   // A healthy result fetched from a FALLBACK location becomes the keyword's
   // stored location: future runs then check the town directly — one check,
   // the SERP real searchers see — instead of re-paying a thin district
-  // check plus a fallback every run. A unique collision (the same keyword
-  // already tracked at that location) just keeps the old location.
+  // check plus a fallback every run. STRICTLY district -> town: a healthy
+  // district result collected after a mid-flight migration must never
+  // overwrite a town target back to its district. A unique collision (the
+  // same keyword already tracked at that location) just keeps the old one.
+  const isDistrictLocation = (s: string) => /^[a-z]{1,2}\d{1,2}[a-z]?$/i.test(s.split(",")[0].trim());
   let persisted = 0;
   for (const s of uniqueSuccesses) {
     if (unwritten.has(s.row.keyword_id) || rankingsFailed.has(s.row.keyword_id)) continue;
     const kw = kwById.get(s.row.keyword_id);
     if (!kw || !s.postedLocation || s.postedLocation === kw.location_name) continue;
+    if (!isDistrictLocation(kw.location_name) || isDistrictLocation(s.postedLocation)) continue;
     if (organicCount(s.items) < THIN_SERP_THRESHOLD) continue;
     const { error } = await service
       .from("tracked_keywords")
