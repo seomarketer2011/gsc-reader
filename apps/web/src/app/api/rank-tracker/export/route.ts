@@ -135,9 +135,14 @@ export async function GET(request: NextRequest) {
   // network's business-name pattern, same derivation as the dashboard.
   const brandSet = new Set<string>();
   for (const d of domains) {
-    const pc = d.serp_location?.split(",")[0].trim().toLowerCase();
     const town = d.location?.trim().toLowerCase();
-    if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) brandSet.add(`${pc} locksmith ${town}`);
+    if (!town) continue;
+    const fromCp = d.serp_location?.split(",")[0].trim().toLowerCase();
+    const pc =
+      fromCp && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(fromCp)
+        ? fromCp
+        : (d.domain.toLowerCase().match(/^([a-z]{1,2}\d{1,2})(?=[a-z])/)?.[1] ?? null);
+    if (pc) brandSet.add(`${pc} locksmith ${town}`);
   }
 
   // homeKey matches domains to keywords checked from their checkpoint

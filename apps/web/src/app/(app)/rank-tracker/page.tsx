@@ -1192,9 +1192,16 @@ export default async function RankTrackerPage({
   // any per-keyword tagging.
   const brandSet = new Set<string>();
   for (const w of watchDomains) {
-    const pc = w.serp_location?.split(",")[0].trim().toLowerCase();
     const town = w.location?.trim().toLowerCase();
-    if (pc && town && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(pc)) brandSet.add(`${pc} locksmith ${town}`);
+    if (!town) continue;
+    // The checkpoint when it is still a district; otherwise the district
+    // embedded in the domain name — migrated domains keep their brand.
+    const fromCp = w.serp_location?.split(",")[0].trim().toLowerCase();
+    const pc =
+      fromCp && /^[a-z]{1,2}\d{1,2}[a-z]?$/.test(fromCp)
+        ? fromCp
+        : (w.domain.toLowerCase().match(/^([a-z]{1,2}\d{1,2})(?=[a-z])/)?.[1] ?? null);
+    if (pc) brandSet.add(`${pc} locksmith ${town}`);
   }
 
   // Districts shared by several towns in this campaign have no safe
