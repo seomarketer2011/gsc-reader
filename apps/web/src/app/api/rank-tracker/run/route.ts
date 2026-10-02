@@ -96,7 +96,19 @@ export async function POST(request: Request) {
     ...queuedToday.map((q) => q.keyword_id),
   ]);
   const toPost = keywords.filter((k) => !excluded.has(k.id));
-  const posted = toPost.length > 0 ? await postSerpTasks(service, orgId, toPost) : 0;
+  // Posting is best-effort per call: every poll recomputes what is still
+  // unposted and sends the remainder, so an interrupted batch resumes on
+  // the next poll instead of killing the run with a bodyless 500.
+  let posted = 0;
+  let postError: string | null = null;
+  if (toPost.length > 0) {
+    try {
+      posted = await postSerpTasks(service, orgId, toPost);
+    } catch (e) {
+      postError = e instanceof Error ? e.message.slice(0, 200) : "posting failed";
+      console.error("rank run: posting interrupted:", postError);
+    }
+  }
 
   const mine = new Set(keywords.map((k) => k.id));
   const watched = await getWatchedDomains(service, orgId);
@@ -133,5 +145,6 @@ export async function POST(request: Request) {
     total,
     posted,
     processing,
+    ...(postError ? { warning: `posting interrupted (${postError}) — resuming on the next poll` } : {}),
   });
 }

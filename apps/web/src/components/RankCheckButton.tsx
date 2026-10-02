@@ -24,6 +24,7 @@ export function RankCheckButton({
     setMessage("Queuing keywords…");
     cancelled.current = false;
     try {
+      let softFailures = 0;
       for (let i = 0; i < 400; i++) {
         if (cancelled.current) return;
         const res = await fetch("/api/rank-tracker/run", {
@@ -31,7 +32,25 @@ export function RankCheckButton({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ campaignId }),
         });
-        const data = await res.json();
+        // An empty or non-JSON body (a mid-run server hiccup) is transient:
+        // the run itself resumes on the next poll, so ride through it.
+        let data: { done?: boolean; checked?: number; total?: number; processing?: number; error?: string; warning?: string } | null = null;
+        try {
+          data = await res.json();
+        } catch {
+          data = null;
+        }
+        if (data === null) {
+          if (++softFailures <= 6) {
+            setMessage(`Server hiccup (HTTP ${res.status}) — retrying, nothing is lost…`);
+            await new Promise((r) => setTimeout(r, 5000));
+            continue;
+          }
+          throw new Error(
+            "The server keeps returning unreadable responses. The run is safe — press the button again to resume it.",
+          );
+        }
+        softFailures = 0;
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
         if (data.done) {
           setState("done");

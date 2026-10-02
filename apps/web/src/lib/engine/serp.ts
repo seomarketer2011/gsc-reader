@@ -437,22 +437,39 @@ export async function postSerpTasks(
   let posted = 0;
   for (let i = 0; i < keywords.length; i += TASK_POST_BATCH) {
     const batch = keywords.slice(i, i + TASK_POST_BATCH);
-    const res = await fetch("https://api.dataforseo.com/v3/serp/google/organic/task_post", {
-      method: "POST",
-      headers: { Authorization: `Basic ${dfsAuth()}`, "Content-Type": "application/json" },
-      body: JSON.stringify(
-        batch.map((k) => ({
-          keyword: k.keyword,
-          location_name: k.location_name,
-          language_name: "English",
-          depth: 100,
-          priority: 1,
-          tag: k.id,
-        })),
-      ),
-    });
-    if (!res.ok) throw new Error(`DataForSEO task_post HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const data = await res.json();
+    // Transient endpoint failures retry with backoff — a single hiccup must
+    // not kill a 2,000-keyword run halfway through posting.
+    let data: { tasks?: { status_code?: number; status_message?: string; id?: string; data?: { tag?: string } }[] } | null = null;
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < 3 && !data; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
+      try {
+        const res = await fetch("https://api.dataforseo.com/v3/serp/google/organic/task_post", {
+          method: "POST",
+          headers: { Authorization: `Basic ${dfsAuth()}`, "Content-Type": "application/json" },
+          body: JSON.stringify(
+            batch.map((k) => ({
+              keyword: k.keyword,
+              location_name: k.location_name,
+              language_name: "English",
+              depth: 100,
+              priority: 1,
+              tag: k.id,
+            })),
+          ),
+        });
+        if (!res.ok) {
+          lastError = new Error(`DataForSEO task_post HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+          if (res.status === 429 || res.status >= 500) continue; // transient
+          throw lastError; // permanent (auth, bad request)
+        }
+        data = await res.json();
+      } catch (e) {
+        if (e === lastError) throw e;
+        lastError = e instanceof Error ? e : new Error("task_post network failure");
+      }
+    }
+    if (!data) throw lastError ?? new Error("DataForSEO task_post failed");
     const rows: { organisation_id: string; keyword_id: string; task_id: string }[] = [];
     for (const t of data.tasks ?? []) {
       const keywordId = t.data?.tag as string | undefined;
