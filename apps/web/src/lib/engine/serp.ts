@@ -201,9 +201,13 @@ async function lookupPlaceBoroughs(town: string, hints: string[]): Promise<strin
               .some((v) => hints.some((h) => v.toLowerCase().includes(h) || h.includes(v.toLowerCase()))),
           )
         : exact;
+      // With hints, a place that matches NONE of them is the wrong place
+      // entirely (the only "Bankside" on record is in Falkirk) — better no
+      // candidate at all, so callers fall back to the postcode's own
+      // councils, than a confident answer from the wrong end of the country.
       out = [
         ...new Set(
-          (hinted.length ? hinted : exact).flatMap((p) =>
+          (hints.length ? hinted : exact).flatMap((p) =>
             [p.district_borough, p.county_unitary].filter((v): v is string => Boolean(v)),
           ),
         ),

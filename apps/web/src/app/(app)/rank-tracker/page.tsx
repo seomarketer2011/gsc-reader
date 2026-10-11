@@ -832,14 +832,15 @@ async function recheckMissingRankings(formData: FormData) {
     const doomed = checks
       .filter((r) => {
         if (has.has(r.keyword_id)) return false;
-        // Same convergence rule as the buttons: a zero on a healthy SERP or
-        // after the fallback is final for today, not re-checkable.
+        // This button is a DELIBERATE re-roll: live probes show Google can
+        // serve a full-size SERP that still misses sites another serve
+        // ranks #1, so healthy-looking zeros are re-checkable on an
+        // explicit press. Only fallback-measured and unsplittable keywords
+        // stay final — re-posting those just repeats the same dance.
         const kwRow = kwRowById.get(r.keyword_id);
         const loc = kwRow?.location_name ?? "";
         const final =
-          (r.organic_count !== null &&
-            (r.organic_count >= THIN_SERP_THRESHOLD ||
-              Boolean(r.search_location && r.search_location !== loc))) ||
+          Boolean(r.search_location && r.search_location !== loc) ||
           unsplittableOnDistrict(districtTownsRR, kwRow?.keyword ?? "", loc);
         return !final;
       })
@@ -927,12 +928,11 @@ async function recheckHomeMissing(formData: FormData) {
     for (const k of slice) {
       const check = checkedToday.get(k.id);
       if (!check) continue;
-      // A zero on a healthy SERP, or one whose fallback already ran, is
-      // final for today — deleting it would just re-pay for the same answer.
+      // Deliberate re-roll: healthy-looking serves can still miss sites
+      // another serve ranks #1, so only fallback-measured and unsplittable
+      // keywords are final here (see recheckMissingRankings).
       const final =
-        (check.organic_count !== null &&
-          (check.organic_count >= THIN_SERP_THRESHOLD ||
-            Boolean(check.search_location && check.search_location !== k.location_name))) ||
+        Boolean(check.search_location && check.search_location !== k.location_name) ||
         unsplittableOnDistrict(districtTownsHM, k.keyword, k.location_name);
       if (final) continue;
       const town = k.location_name.split(",")[0].trim().toLowerCase();
@@ -1706,14 +1706,14 @@ export default async function RankTrackerPage({
             })()}
             {(() => {
               if (watchedTotal === 0) return null;
-              // A zero is FINAL for today when its SERP was healthy, or the
-              // town/council fallback already ran: re-checking it just pays
-              // to reconfirm. Only artifacts still worth redoing are counted,
-              // so this button converges to zero instead of looping.
+              // Deliberate re-roll: Google can serve a full-size SERP that
+              // still misses sites another serve ranks #1 (proven by live
+              // probes), so a zero is only FINAL when the fallback already
+              // measured it from elsewhere, or the keyword is unsplittable.
+              // Convergence is the pressing finger: genuine zeros come back
+              // as zeros and the number stabilises.
               const finalToday = (s: (typeof summarised)[number]) =>
-                (s.check!.organicCount !== null &&
-                  (s.check!.organicCount >= THIN_SERP_THRESHOLD ||
-                    Boolean(s.check!.searchLocation && s.check!.searchLocation !== s.k.location_name))) ||
+                Boolean(s.check!.searchLocation && s.check!.searchLocation !== s.k.location_name) ||
                 unsplittableOnDistrict(districtTowns, s.k.keyword, s.k.location_name);
               const homeMissingToday = summarised.filter(
                 (s) =>
@@ -1741,12 +1741,10 @@ export default async function RankTrackerPage({
               const missing = keywords.filter((k) => {
                 const check = latestCheck.get(k.id);
                 if (!check || check.error || check.date !== todayStr || rankedAnyToday.has(k.id)) return false;
-                // Skip zeros that are final for today (healthy SERP, or the
-                // fallback already ran) — same convergence rule as above.
+                // Deliberate re-roll — only fallback-measured and
+                // unsplittable keywords are final (mirrors the action).
                 const final =
-                  (check.organicCount !== null &&
-                    (check.organicCount >= THIN_SERP_THRESHOLD ||
-                      Boolean(check.searchLocation && check.searchLocation !== k.location_name))) ||
+                  Boolean(check.searchLocation && check.searchLocation !== k.location_name) ||
                   unsplittableOnDistrict(districtTowns, k.keyword, k.location_name);
                 return !final;
               }).length;
