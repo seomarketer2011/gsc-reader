@@ -990,3 +990,56 @@ export async function getWatchedDomains(
   }
   return [...out.values()];
 }
+
+// ── Second-source verification (Serper.dev) ────────────────────────────────
+
+/**
+ * Fetches the top 20 organic results for one keyword from Serper.dev —
+ * an independent fetch path from the primary DataForSEO checks, which
+ * makes it a cheap second opinion on "home site not ranking" verdicts
+ * (false ABSENCE is the primary tracker's only real failure mode; a found
+ * position can't be hallucinated). Two paginated requests of 10 (Google no
+ * longer honours num=100), ~2 credits. Returns organic results with
+ * positions offset across pages, or null when the key is missing or the
+ * fetch fails — verification is always best-effort.
+ */
+export async function serperTop20(
+  keyword: string,
+  locationName: string,
+): Promise<{ position: number; domain: string; url: string }[] | null> {
+  const key = process.env.SERPER_API_KEY;
+  if (!key) return null;
+  const out: { position: number; domain: string; url: string }[] = [];
+  for (let page = 1; page <= 2; page++) {
+    try {
+      const res = await fetch("https://google.serper.dev/search", {
+        method: "POST",
+        headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          q: keyword,
+          location: locationName.replace(/,England,United Kingdom$/, ", England, United Kingdom"),
+          gl: "gb",
+          hl: "en",
+          num: 10,
+          page,
+          device: "mobile",
+        }),
+      });
+      if (!res.ok) return page === 1 ? null : out;
+      const data = (await res.json()) as { organic?: { position?: number; link?: string }[] };
+      for (const o of data.organic ?? []) {
+        if (!o.link) continue;
+        let domain = "";
+        try {
+          domain = normaliseDomain(new URL(o.link).hostname);
+        } catch {
+          continue;
+        }
+        out.push({ position: (page - 1) * 10 + (o.position ?? 0), domain, url: o.link });
+      }
+    } catch {
+      return page === 1 ? null : out;
+    }
+  }
+  return out;
+}

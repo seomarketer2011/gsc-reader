@@ -12,6 +12,7 @@ import {
   resolveBoroughForLocation,
   resolveLocation,
   resolveTownForDistrict,
+  serperTop20,
   THIN_SERP_THRESHOLD,
   TopResult,
 } from "@/lib/engine/serp";
@@ -1009,6 +1010,135 @@ async function recheckRelocated(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/** Second-source verification: for keywords whose home site recorded no
+ * ranking TODAY, fetches the top 20 from Serper.dev — an independent fetch
+ * path from the primary checks — and stores what it saw as a serper-tagged
+ * attempt row. False ABSENCE is the primary tracker's only real failure
+ * mode (a found position cannot be hallucinated), so verifying just the
+ * negatives covers the possible errors, at ~2 Serper credits each. Up to
+ * 100 keywords per press (Worker subrequest budget) — press again for the
+ * rest. Never changes the primary check; the dashboard shows both reads. */
+async function verifySecondSource(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const [domains, keywords] = await Promise.all([
+    fetchAllRows<{ domain: string; location: string | null; serp_location: string | null }>(
+      (from, to) =>
+        c.supabase
+          .from("tracked_domains")
+          .select("domain, location, serp_location")
+          .eq("campaign_id", c.campaignId)
+          .order("id")
+          .range(from, to),
+    ),
+    fetchAllRows<{ id: string; keyword: string; location_name: string }>((from, to) =>
+      c.supabase
+        .from("tracked_keywords")
+        .select("id, keyword, location_name")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+    ),
+  ]);
+  const candidates = domains
+    .map((d) => ({
+      domain: normaliseDomain(d.domain),
+      homeKey: (d.serp_location ?? d.location)?.split(",")[0].trim().toLowerCase() || null,
+      townLower: d.location?.trim().toLowerCase() ?? null,
+    }))
+    .filter((d) => d.homeKey);
+  const watchedSet = new Set(domains.map((d) => normaliseDomain(d.domain)));
+  const already = new Set(
+    (
+      await fetchAllRows<{ keyword_id: string }>((from, to) =>
+        c.supabase
+          .from("serp_check_attempts")
+          .select("keyword_id")
+          .eq("organisation_id", c.orgId)
+          .eq("check_date", today)
+          .like("task_id", "serper:%")
+          .order("id")
+          .range(from, to),
+      )
+    ).map((r) => r.keyword_id),
+  );
+  let verified = 0;
+  const CAP = 100;
+  outer: for (let i = 0; i < keywords.length; i += 50) {
+    const slice = keywords.slice(i, i + 50);
+    const ids = slice.map((k) => k.id);
+    const [checks, ranked] = await Promise.all([
+      fetchAllRows<{ keyword_id: string }>((from, to) =>
+        c.supabase
+          .from("serp_checks")
+          .select("keyword_id")
+          .eq("check_date", today)
+          .is("error", null)
+          .in("keyword_id", ids)
+          .order("keyword_id")
+          .range(from, to),
+      ),
+      fetchAllRows<{ keyword_id: string; domain: string }>((from, to) =>
+        c.supabase
+          .from("serp_rankings")
+          .select("keyword_id, domain")
+          .eq("check_date", today)
+          .in("keyword_id", ids)
+          .order("id")
+          .range(from, to),
+      ),
+    ]);
+    const checkedToday = new Set(checks.map((r) => r.keyword_id));
+    const rankedBy = new Map<string, Set<string>>();
+    for (const r of ranked) {
+      const set = rankedBy.get(r.keyword_id) ?? new Set<string>();
+      set.add(r.domain);
+      rankedBy.set(r.keyword_id, set);
+    }
+    for (const k of slice) {
+      if (already.has(k.id) || !checkedToday.has(k.id)) continue;
+      const town = k.location_name.split(",")[0].trim().toLowerCase();
+      let atCheckpoint = candidates.filter((d) => d.homeKey === town || d.townLower === town);
+      if (atCheckpoint.length === 0) {
+        const textAll = candidates.filter((d) => d.townLower && k.keyword.includes(d.townLower));
+        const maxLen = Math.max(0, ...textAll.map((d) => d.townLower!.length));
+        atCheckpoint = textAll.filter((d) => d.townLower!.length === maxLen);
+      }
+      let textMatches = atCheckpoint.filter((d) => d.townLower && k.keyword.includes(d.townLower));
+      const tmMax = Math.max(0, ...textMatches.map((d) => d.townLower!.length));
+      textMatches = textMatches.filter((d) => d.townLower!.length === tmMax);
+      const homeSet = (textMatches.length > 0 ? textMatches : atCheckpoint).map((d) => d.domain);
+      if (homeSet.length === 0) continue;
+      const rankedSet = rankedBy.get(k.id);
+      if (rankedSet && homeSet.some((d) => rankedSet.has(d))) continue; // home ranks
+      const results = await serperTop20(k.keyword, k.location_name);
+      if (results === null) break outer; // no key, or the provider is down
+      const found = results.filter((r) => watchedSet.has(r.domain));
+      await c.supabase.from("serp_check_attempts").upsert(
+        [
+          {
+            organisation_id: c.orgId,
+            keyword_id: k.id,
+            posted_location: k.location_name,
+            device: "mobile",
+            organic_count: results.length,
+            rankings_count: found.length,
+            rankings: found.map((r) => ({ d: r.domain, p: r.position })),
+            task_id: `serper:${k.id}:${today}`,
+          },
+        ],
+        { onConflict: "task_id", ignoreDuplicates: true },
+      );
+      verified++;
+      if (verified >= CAP) break outer;
+    }
+  }
+  revalidatePath("/rank-tracker");
+  redirect(`/rank-tracker?campaign=${c.campaignId}&verified=${verified}`);
+}
+
 /** Fetches (and caches for 30 days) Google Ads UK search volumes for every
  * keyword in this campaign that has none yet. Chunked so request URLs stay
  * sane; only missing/stale keywords are paid for. */
@@ -1258,6 +1388,24 @@ export default async function RankTrackerPage({
       )
     : [];
   const inFlight = queued.filter((r) => keywordIds.has(r.keyword_id)).length;
+
+  // Today's second-source verifications (Serper top-20) — written by the
+  // Verify button, shown as a badge on home-missing cards. Absent table
+  // (migration not applied) just reads as empty.
+  const verifyRows = keywords.length
+    ? await fetchAllRows<{ keyword_id: string; rankings: { d: string; p: number }[] | null }>(
+        (from, to) =>
+          c.supabase
+            .from("serp_check_attempts")
+            .select("keyword_id, rankings")
+            .eq("organisation_id", c.orgId)
+            .eq("check_date", todayStr)
+            .like("task_id", "serper:%")
+            .order("id")
+            .range(from, to),
+      )
+    : [];
+  const verifiedBy = new Map(verifyRows.map((r) => [r.keyword_id, r.rankings ?? []]));
   const collectedToday = checks.filter((r) => r.check_date === todayStr).length;
 
   const latestCheck = new Map<
@@ -1790,6 +1938,29 @@ export default async function RankTrackerPage({
               ) : null;
             })()}
             {(() => {
+              const unverified = summarised.filter(
+                (s) =>
+                  s.hasHome &&
+                  s.check &&
+                  !s.check.error &&
+                  s.check.date === todayStr &&
+                  !s.home &&
+                  !verifiedBy.has(s.k.id),
+              ).length;
+              return unverified > 0 ? (
+                <form action={verifySecondSource}>
+                  <input type="hidden" name="campaign" value={campaignId} />
+                  <PendingButton
+                    pendingLabel="Verifying via 2nd source…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Verify {Math.min(unverified, 100)} home-missing via 2nd source
+                    {unverified > 100 ? ` (${unverified} total — press again for the rest)` : ""}
+                  </PendingButton>
+                </form>
+              ) : null;
+            })()}
+            {(() => {
               const missingVol = new Set(
                 keywords.filter((k) => !volumeByKeyword.has(k.keyword)).map((k) => k.keyword),
               ).size;
@@ -1883,6 +2054,19 @@ export default async function RankTrackerPage({
                               ) : (
                                 <Badge tone="warning">home site not ranking</Badge>
                               ))}
+                            {hasHome &&
+                              !home &&
+                              verifiedBy.has(k.id) &&
+                              (() => {
+                                const hit = (verifiedBy.get(k.id) ?? [])
+                                  .filter((r) => homeSet.has(r.d))
+                                  .sort((a, b) => a.p - b.p)[0];
+                                return hit ? (
+                                  <Badge tone="good">2nd source: home #{hit.p}</Badge>
+                                ) : (
+                                  <span className="text-muted">2nd source: absent in top 20 too</span>
+                                );
+                              })()}
                             <span className="tnum">
                               {ranked.length} of {watchedTotal} rank
                             </span>
