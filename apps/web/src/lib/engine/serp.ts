@@ -818,6 +818,38 @@ export async function collectSerpResults(
   // If a checks write fails, keep those queue rows so the results are
   // re-fetched next pass instead of being lost between the two writes.
   const CHUNK = 100; // keep .in() URLs and payloads comfortable
+
+  // Append-only flux log (serp_check_attempts migration). serp_checks is
+  // unique per keyword/day, so a same-day re-check OVERWRITES the previous
+  // observation — and Google has been seen serving a #1 and a not-in-top-100
+  // SERP for the same request minutes apart. This keeps every roll of that
+  // dice. Best-effort: a missing table or failed insert never affects
+  // collection.
+  {
+    const rankedCountByKw = new Map<string, number>();
+    for (const r of rankingRows) {
+      const id = r.keyword_id as string;
+      rankedCountByKw.set(id, (rankedCountByKw.get(id) ?? 0) + 1);
+    }
+    const attemptRows = uniqueSuccesses.map((s) => ({
+      organisation_id: orgId,
+      keyword_id: s.row.keyword_id,
+      posted_location: s.postedLocation || null,
+      device: "mobile",
+      organic_count: organicCount(s.items),
+      rankings_count: rankedCountByKw.get(s.row.keyword_id) ?? 0,
+      task_id: s.row.task_id,
+    }));
+    for (let i = 0; i < attemptRows.length; i += CHUNK) {
+      const { error: attErr } = await service
+        .from("serp_check_attempts")
+        .insert(attemptRows.slice(i, i + CHUNK));
+      if (attErr) {
+        console.error("serp collect: attempts log skipped:", attErr.message);
+        break;
+      }
+    }
+  }
   const unwritten = new Set<string>();
   for (let i = 0; i < checkRows.length; i += CHUNK) {
     const slice = checkRows.slice(i, i + CHUNK);
