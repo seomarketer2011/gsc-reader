@@ -826,10 +826,12 @@ export async function collectSerpResults(
   // dice. Best-effort: a missing table or failed insert never affects
   // collection.
   {
-    const rankedCountByKw = new Map<string, number>();
+    const rankedByKw = new Map<string, { d: string; p: number }[]>();
     for (const r of rankingRows) {
       const id = r.keyword_id as string;
-      rankedCountByKw.set(id, (rankedCountByKw.get(id) ?? 0) + 1);
+      const list = rankedByKw.get(id) ?? [];
+      if (list.length < 30) list.push({ d: r.domain as string, p: r.position as number });
+      rankedByKw.set(id, list);
     }
     const attemptRows = uniqueSuccesses.map((s) => ({
       organisation_id: orgId,
@@ -837,13 +839,16 @@ export async function collectSerpResults(
       posted_location: s.postedLocation || null,
       device: "mobile",
       organic_count: organicCount(s.items),
-      rankings_count: rankedCountByKw.get(s.row.keyword_id) ?? 0,
+      rankings_count: rankedByKw.get(s.row.keyword_id)?.length ?? 0,
+      rankings: rankedByKw.get(s.row.keyword_id) ?? [],
       task_id: s.row.task_id,
     }));
     for (let i = 0; i < attemptRows.length; i += CHUNK) {
+      // Unique on task_id: a collection retry (queue rows kept after a
+      // failed write) re-collects the same task, and must not double-log it.
       const { error: attErr } = await service
         .from("serp_check_attempts")
-        .insert(attemptRows.slice(i, i + CHUNK));
+        .upsert(attemptRows.slice(i, i + CHUNK), { onConflict: "task_id", ignoreDuplicates: true });
       if (attErr) {
         console.error("serp collect: attempts log skipped:", attErr.message);
         break;
