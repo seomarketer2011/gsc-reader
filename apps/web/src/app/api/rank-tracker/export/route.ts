@@ -184,10 +184,13 @@ export async function GET(request: NextRequest) {
       const maxLen = Math.max(0, ...textAll.map(([, t]) => t.length));
       candidates = textAll.filter(([, t]) => t.length === maxLen).map(([d]) => d);
     }
-    const textMatches = candidates.filter((d) => {
+    let textMatches = candidates.filter((d) => {
       const t = homeTownLower.get(d);
       return t && k.keyword.includes(t);
     });
+    // Longest town name wins inside the borough too (mirrors the dashboard).
+    const tmMax = Math.max(0, ...textMatches.map((d) => homeTownLower.get(d)!.length));
+    textMatches = textMatches.filter((d) => homeTownLower.get(d)!.length === tmMax);
     const homeSet = new Set(textMatches.length > 0 ? textMatches : candidates);
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && homeKey.has(r.domain));

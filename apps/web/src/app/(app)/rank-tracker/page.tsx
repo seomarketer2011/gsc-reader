@@ -631,36 +631,40 @@ async function pinToBoroughs(formData: FormData) {
       .range(from, to),
   );
   const cache = new Map<string, string | null>();
-  const boroughOf = async (town: string | null, outcode: string | null) => {
+  // Borough first; when the catalogue has no entry for the borough itself
+  // (Hillingdon, Havering…), the town's own disambiguated entry
+  // ("Northwood,Greater London") — never region-wide Greater London.
+  const targetOf = async (town: string | null, outcode: string | null) => {
     const key = `${(town ?? "").toLowerCase()}|${(outcode ?? "").toLowerCase()}`;
-    if (!cache.has(key)) cache.set(key, await resolveBoroughForLocation(locations, town, outcode));
+    if (!cache.has(key)) {
+      let t = await resolveBoroughForLocation(locations, town, outcode);
+      if (!t && town) t = await resolveTownForDistrict(locations, town, outcode);
+      cache.set(key, t);
+    }
     return cache.get(key)!;
   };
-  // Each domain's borough, from its town plus its postcode district (the
-  // checkpoint when it is one, the domain-name prefix otherwise).
+  // Each domain's measurement target, from its town plus its postcode
+  // district (the checkpoint when it is one, the domain-name prefix
+  // otherwise). Keywords then INHERIT their home domain's target, so a
+  // keyword always measures from where its own site lives.
   let domMoved = 0;
-  const boroughsByTown = new Map<string, Set<string>>();
+  const txtDoms: { townLower: string; target: string }[] = [];
   for (const d of domains) {
     const town = d.location?.split(",")[0].trim() || null;
     const cp = d.serp_location?.split(",")[0].trim();
     const outcode =
       cp && isDistrict(cp) ? cp : (d.domain.toLowerCase().match(/^([a-z]{1,2}\d{1,2})(?=[a-z])/)?.[1] ?? null);
-    const borough = await boroughOf(town, outcode);
-    if (!borough) continue;
-    if (town) {
-      const set = boroughsByTown.get(town.toLowerCase()) ?? new Set<string>();
-      set.add(borough);
-      boroughsByTown.set(town.toLowerCase(), set);
-    }
-    if ((d.serp_location ?? "") !== borough) {
+    const target = await targetOf(town, outcode);
+    if (!target) continue;
+    if (town) txtDoms.push({ townLower: town.toLowerCase(), target });
+    if ((d.serp_location ?? "") !== target) {
       await c.supabase
         .from("tracked_domains")
-        .update({ serp_location: borough, location_valid: true })
+        .update({ serp_location: target, location_valid: true })
         .eq("id", d.id);
       domMoved++;
     }
   }
-  const townList = [...boroughsByTown.keys()];
   const kws = await fetchAllRows<{ id: string; keyword: string; location_name: string }>(
     (from, to) =>
       c.supabase
@@ -670,27 +674,22 @@ async function pinToBoroughs(formData: FormData) {
         .order("id")
         .range(from, to),
   );
-  const renameIds = new Map<string, string[]>(); // target borough -> keyword ids
+  const renameIds = new Map<string, string[]>(); // target location -> keyword ids
   let kwSkipped = 0;
   let kwPinned = 0;
   for (const k of kws) {
+    // The keyword's home: the longest campaign town named in its text
+    // ("pinner green" beats "pinner"). Its measurement location is that
+    // domain's — identical by construction, never independently resolved.
+    const text = k.keyword.toLowerCase();
+    const named = txtDoms.filter((d) => text.includes(d.townLower));
+    const maxLen = Math.max(0, ...named.map((d) => d.townLower.length));
+    const targets = new Set(named.filter((d) => d.townLower.length === maxLen).map((d) => d.target));
+    let target: string | null = targets.size === 1 ? [...targets][0] : null;
+    // Two same-named towns (the two Plaistows) stay put; a district
+    // location still upgrades from its own outcode.
     const cur = k.location_name.split(",")[0].trim();
-    let target: string | null = null;
-    // The stored town maps to exactly one borough…
-    const direct = boroughsByTown.get(cur.toLowerCase());
-    if (direct?.size === 1) target = [...direct][0];
-    // …or the keyword text names a town that does (longest name wins)…
-    if (!target) {
-      const text = k.keyword.toLowerCase();
-      const named = townList.filter((t) => text.includes(t));
-      const maxLen = Math.max(0, ...named.map((t) => t.length));
-      const best = new Set(
-        named.filter((t) => t.length === maxLen).flatMap((t) => [...(boroughsByTown.get(t) ?? [])]),
-      );
-      if (best.size === 1) target = [...best][0];
-    }
-    // …or a district location resolves straight from its outcode.
-    if (!target && isDistrict(cur)) target = await boroughOf(null, cur);
+    if (!target && isDistrict(cur)) target = await targetOf(null, cur.toLowerCase());
     if (!target) {
       kwSkipped++;
       continue;
@@ -942,7 +941,9 @@ async function recheckHomeMissing(formData: FormData) {
         const maxLen = Math.max(0, ...textAll.map((d) => d.townLower!.length));
         atCheckpoint = textAll.filter((d) => d.townLower!.length === maxLen);
       }
-      const textMatches = atCheckpoint.filter((d) => d.townLower && k.keyword.includes(d.townLower));
+      let textMatches = atCheckpoint.filter((d) => d.townLower && k.keyword.includes(d.townLower));
+      const tmMax = Math.max(0, ...textMatches.map((d) => d.townLower!.length));
+      textMatches = textMatches.filter((d) => d.townLower!.length === tmMax);
       const homeSet = (textMatches.length > 0 ? textMatches : atCheckpoint).map((d) => d.domain);
       if (homeSet.length === 0) continue; // no home site to be missing
       const rankedSet = rankedBy.get(k.id);
@@ -1405,9 +1406,13 @@ export default async function RankTrackerPage({
       const maxLen = Math.max(0, ...textAll.map(([, w]) => w.homeTownLower!.length));
       candidates = textAll.filter(([, w]) => w.homeTownLower!.length === maxLen);
     }
-    const textMatches = candidates.filter(
+    let textMatches = candidates.filter(
       ([, w]) => w.homeTownLower && k.keyword.includes(w.homeTownLower),
     );
+    // Longest town name wins inside the borough too — "pinner green" must
+    // not also count the plain Pinner site as home.
+    const tmMax = Math.max(0, ...textMatches.map(([, w]) => w.homeTownLower!.length));
+    textMatches = textMatches.filter(([, w]) => w.homeTownLower!.length === tmMax);
     const homeSet = new Set((textMatches.length > 0 ? textMatches : candidates).map(([d]) => d));
     const home = ranked.find((r) => homeSet.has(r.domain)) ?? null;
     const overlap = ranked.filter((r) => !homeSet.has(r.domain) && watched.get(r.domain)?.homeKey);
