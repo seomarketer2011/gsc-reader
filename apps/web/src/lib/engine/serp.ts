@@ -258,6 +258,38 @@ export async function resolveTownForDistrict(
   return null;
 }
 
+/**
+ * Resolves a location to its BOROUGH/council geo-target: the town's own
+ * borough from the OS place records first (accurate when a district
+ * straddles several councils), then the district's councils in order.
+ * Borough targets are the reliability sweet spot — big, high-confidence
+ * geo-targets Google always serves a full SERP for, and a fixed vantage
+ * that never shifts between runs the way per-town fallbacks can.
+ * Returns the canonical DataForSEO name, or null when nothing resolves.
+ */
+export async function resolveBoroughForLocation(
+  index: UkLocationIndex | null,
+  town: string | null,
+  outcode: string | null,
+): Promise<string | null> {
+  const info = outcode ? await lookupOutcode(outcode) : null;
+  const hints = info
+    ? [...info.adminDistricts, info.region ?? ""].filter(Boolean).map((h) => h.toLowerCase())
+    : [];
+  const candidates: string[] = [];
+  if (town) candidates.push(...(await lookupPlaceBoroughs(town, hints)));
+  if (info) candidates.push(...info.adminDistricts);
+  for (const cand of candidates) {
+    // "Barking and Dagenham" style council names fall back to their parts,
+    // which is what the Google Ads catalogue lists.
+    for (const name of [cand, ...(cand.includes(" and ") ? cand.split(" and ") : [])]) {
+      const r = resolveLocation(index, name.trim());
+      if (r.valid) return r.name;
+    }
+  }
+  return null;
+}
+
 interface SerpItem {
   type: string;
   rank_group: number;
@@ -283,7 +315,9 @@ async function fetchSerp(keyword: string, locationName: string): Promise<SerpIte
         method: "POST",
         headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json" },
         body: JSON.stringify([
-          { keyword, location_name: locationName, language_name: "English", depth: 100 },
+          // Mobile, like the overwhelming majority of real local-service
+          // searches (our own GSC data shows mobile positions ~2x better).
+          { keyword, location_name: locationName, language_name: "English", depth: 100, device: "mobile", os: "android" },
         ]),
       });
     } catch (e) {
@@ -455,6 +489,10 @@ export async function postSerpTasks(
               depth: 100,
               priority: 1,
               tag: k.id,
+              // Mobile, like the overwhelming majority of real local-service
+              // searches — desktop checks measure the minority view.
+              device: "mobile",
+              os: "android",
             })),
           ),
         });

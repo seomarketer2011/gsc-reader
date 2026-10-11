@@ -9,6 +9,7 @@ import { getVolumes } from "@/lib/engine/volumes";
 import {
   fetchUkLocations,
   normaliseDomain,
+  resolveBoroughForLocation,
   resolveLocation,
   resolveTownForDistrict,
   THIN_SERP_THRESHOLD,
@@ -597,6 +598,134 @@ async function migrateCheckpointsToTowns(formData: FormData) {
   revalidatePath("/rank-tracker");
   redirect(
     `/rank-tracker?campaign=${c.campaignId}&migrated=${migrated}&kwmigrated=${kwMigrated}&unchanged=${unchanged}`,
+  );
+}
+
+/**
+ * Pins every checkpoint and keyword to its BOROUGH geo-target. Boroughs are
+ * the measurement sweet spot: big, high-confidence targets Google always
+ * serves a full SERP for, and one fixed vantage per area that never shifts
+ * between runs the way per-town fallbacks can — so run-to-run movement is
+ * rank movement, not vantage movement. Keywords whose town cannot be
+ * resolved to exactly one borough (ambiguous names shared by two boroughs)
+ * keep their current location and the thin-SERP fallback. Idempotent.
+ */
+async function pinToBoroughs(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const locations = await fetchUkLocations();
+  if (!locations) return; // lookup unavailable — change nothing
+  const isDistrict = (s: string) => /^[a-z]{1,2}\d{1,2}[a-z]?$/i.test(s.split(",")[0].trim());
+  const domains = await fetchAllRows<{
+    id: string;
+    domain: string;
+    location: string | null;
+    serp_location: string | null;
+  }>((from, to) =>
+    c.supabase
+      .from("tracked_domains")
+      .select("id, domain, location, serp_location")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  const cache = new Map<string, string | null>();
+  const boroughOf = async (town: string | null, outcode: string | null) => {
+    const key = `${(town ?? "").toLowerCase()}|${(outcode ?? "").toLowerCase()}`;
+    if (!cache.has(key)) cache.set(key, await resolveBoroughForLocation(locations, town, outcode));
+    return cache.get(key)!;
+  };
+  // Each domain's borough, from its town plus its postcode district (the
+  // checkpoint when it is one, the domain-name prefix otherwise).
+  let domMoved = 0;
+  const boroughsByTown = new Map<string, Set<string>>();
+  for (const d of domains) {
+    const town = d.location?.split(",")[0].trim() || null;
+    const cp = d.serp_location?.split(",")[0].trim();
+    const outcode =
+      cp && isDistrict(cp) ? cp : (d.domain.toLowerCase().match(/^([a-z]{1,2}\d{1,2})(?=[a-z])/)?.[1] ?? null);
+    const borough = await boroughOf(town, outcode);
+    if (!borough) continue;
+    if (town) {
+      const set = boroughsByTown.get(town.toLowerCase()) ?? new Set<string>();
+      set.add(borough);
+      boroughsByTown.set(town.toLowerCase(), set);
+    }
+    if ((d.serp_location ?? "") !== borough) {
+      await c.supabase
+        .from("tracked_domains")
+        .update({ serp_location: borough, location_valid: true })
+        .eq("id", d.id);
+      domMoved++;
+    }
+  }
+  const townList = [...boroughsByTown.keys()];
+  const kws = await fetchAllRows<{ id: string; keyword: string; location_name: string }>(
+    (from, to) =>
+      c.supabase
+        .from("tracked_keywords")
+        .select("id, keyword, location_name")
+        .eq("campaign_id", c.campaignId)
+        .order("id")
+        .range(from, to),
+  );
+  const renameIds = new Map<string, string[]>(); // target borough -> keyword ids
+  let kwSkipped = 0;
+  let kwPinned = 0;
+  for (const k of kws) {
+    const cur = k.location_name.split(",")[0].trim();
+    let target: string | null = null;
+    // The stored town maps to exactly one borough…
+    const direct = boroughsByTown.get(cur.toLowerCase());
+    if (direct?.size === 1) target = [...direct][0];
+    // …or the keyword text names a town that does (longest name wins)…
+    if (!target) {
+      const text = k.keyword.toLowerCase();
+      const named = townList.filter((t) => text.includes(t));
+      const maxLen = Math.max(0, ...named.map((t) => t.length));
+      const best = new Set(
+        named.filter((t) => t.length === maxLen).flatMap((t) => [...(boroughsByTown.get(t) ?? [])]),
+      );
+      if (best.size === 1) target = [...best][0];
+    }
+    // …or a district location resolves straight from its outcode.
+    if (!target && isDistrict(cur)) target = await boroughOf(null, cur);
+    if (!target) {
+      kwSkipped++;
+      continue;
+    }
+    if (k.location_name === target) continue; // already pinned
+    const list = renameIds.get(target) ?? [];
+    list.push(k.id);
+    renameIds.set(target, list);
+  }
+  for (const [target, ids] of renameIds) {
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const { error } = await c.supabase
+        .from("tracked_keywords")
+        .update({ location_name: target, location_valid: true })
+        .in("id", chunk);
+      if (!error) {
+        kwPinned += chunk.length;
+        continue;
+      }
+      // A unique collision somewhere in the chunk — move rows one by one and
+      // leave any duplicate at its old location rather than lose history.
+      for (const id of chunk) {
+        const { error: e2 } = await c.supabase
+          .from("tracked_keywords")
+          .update({ location_name: target, location_valid: true })
+          .eq("id", id);
+        if (!e2) kwPinned++;
+        else kwSkipped++;
+      }
+    }
+  }
+  revalidatePath("/rank-tracker");
+  redirect(
+    `/rank-tracker?campaign=${c.campaignId}&pinned=${domMoved}&kwpinned=${kwPinned}&kwskipped=${kwSkipped}`,
   );
 }
 
@@ -1393,6 +1522,24 @@ export default async function RankTrackerPage({
         </Card>
       )}
 
+      {typeof params.kwpinned === "string" && (
+        <Card className="mb-4 border-good/40 p-3 text-sm text-ink">
+          <span className="font-medium">Pinned to boroughs:</span>{" "}
+          <span className="tnum">{params.kwpinned}</span> keywords and{" "}
+          <span className="tnum">{typeof params.pinned === "string" ? params.pinned : 0}</span>{" "}
+          checkpoints now measure from a fixed borough geo-target
+          {typeof params.kwskipped === "string" && params.kwskipped !== "0" ? (
+            <>
+              {" "}
+              (<span className="tnum">{params.kwskipped}</span> keywords kept their location —
+              town shared by two boroughs or nothing resolved)
+            </>
+          ) : null}
+          . All future checks run as mobile searches. Press &ldquo;Check rankings now&rdquo; to
+          re-baseline everything on the new measurement.
+        </Card>
+      )}
+
       {inFlight > 0 && (
         <Card className="mb-4 border-series-1/40 p-3 text-sm text-ink">
           <span className="font-medium">Rank check in progress:</span>{" "}
@@ -1903,6 +2050,23 @@ export default async function RankTrackerPage({
               user sees. This moves every district checkpoint (and its keywords) to the town&rsquo;s
               own geo-target where one resolves; districts without one keep their checkpoint and
               rely on the thin-SERP fallback instead. Safe to press again any time.
+            </p>
+          </form>
+          <form action={pinToBoroughs} className="mt-3">
+            <input type="hidden" name="campaign" value={campaignId} />
+            <PendingButton
+              pendingLabel="Pinning to boroughs…"
+              className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+            >
+              Pin every keyword to its borough (most consistent)
+            </PendingButton>
+            <p className="mt-1 text-xs text-muted">
+              Boroughs are big, high-confidence geo-targets Google always serves a full SERP for,
+              and one fixed vantage per area means run-to-run movement is rank movement, not
+              vantage movement. Ambiguous towns that two boroughs share keep their current
+              location. Checks are also posted as <span className="font-medium">mobile</span>{" "}
+              searches from now on — the view most real local searchers get. Safe to press again
+              any time.
             </p>
           </form>
           {watchDomains.some((w) => w.location_valid === false) && (
