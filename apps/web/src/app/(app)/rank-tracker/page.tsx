@@ -960,6 +960,54 @@ async function recheckHomeMissing(formData: FormData) {
   revalidatePath("/rank-tracker");
 }
 
+/** Deletes TODAY's checks that were measured from a DIFFERENT location than
+ * the keyword is now pinned to — e.g. straight after a borough re-pin — so
+ * "Check rankings now" redoes just those the same day instead of waiting for
+ * tomorrow's run. Everything already measured from its pinned location keeps
+ * today's check and is not re-charged. The thin-SERP fallback also records a
+ * differing search_location, so fallback results are re-checked too: after a
+ * re-pin that is the point — one fresh check from the newly pinned vantage. */
+async function recheckRelocated(formData: FormData) {
+  "use server";
+  const c = await callerCampaign(formData);
+  if (!c) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const kwRows = await fetchAllRows<{ id: string; location_name: string }>((from, to) =>
+    c.supabase
+      .from("tracked_keywords")
+      .select("id, location_name")
+      .eq("campaign_id", c.campaignId)
+      .order("id")
+      .range(from, to),
+  );
+  const locById = new Map(kwRows.map((k) => [k.id, k.location_name]));
+  for (let i = 0; i < kwRows.length; i += 50) {
+    const slice = kwRows.slice(i, i + 50).map((k) => k.id);
+    const checks = await fetchAllRows<{ keyword_id: string; search_location: string | null }>(
+      (from, to) =>
+        c.supabase
+          .from("serp_checks")
+          .select("keyword_id, search_location")
+          .eq("check_date", today)
+          .is("error", null)
+          .in("keyword_id", slice)
+          .order("keyword_id")
+          .range(from, to),
+    );
+    const doomed = checks
+      .filter((r) => r.search_location && r.search_location !== locById.get(r.keyword_id))
+      .map((r) => r.keyword_id);
+    if (doomed.length > 0) {
+      await c.supabase
+        .from("serp_checks")
+        .delete()
+        .eq("check_date", today)
+        .in("keyword_id", doomed);
+    }
+  }
+  revalidatePath("/rank-tracker");
+}
+
 /** Fetches (and caches for 30 days) Google Ads UK search volumes for every
  * keyword in this campaign that has none yet. Chunked so request URLs stay
  * sane; only missing/stale keywords are paid for. */
@@ -1710,6 +1758,30 @@ export default async function RankTrackerPage({
                     className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
                   >
                     Re-check {missing} with no rankings recorded (then press Check rankings now)
+                  </PendingButton>
+                </form>
+              ) : null;
+            })()}
+            {(() => {
+              const relocated = keywords.filter((k) => {
+                const check = latestCheck.get(k.id);
+                return (
+                  check &&
+                  !check.error &&
+                  check.date === todayStr &&
+                  check.searchLocation &&
+                  check.searchLocation !== k.location_name
+                );
+              }).length;
+              return relocated > 0 ? (
+                <form action={recheckRelocated}>
+                  <input type="hidden" name="campaign" value={campaignId} />
+                  <PendingButton
+                    pendingLabel="Unlocking…"
+                    className="rounded-md border border-edge px-2 py-1 text-sm font-medium text-series-1 hover:bg-page"
+                  >
+                    Re-check {relocated} measured from an old location (then press Check rankings
+                    now)
                   </PendingButton>
                 </form>
               ) : null;
