@@ -216,6 +216,41 @@ async function lookupPlaceBoroughs(town: string, hints: string[]): Promise<strin
   return out;
 }
 
+/** Metropolitan/ceremonial counties the OS place records report as a town's
+ * county. They resolve in the geo catalogue (e.g. "Greater London") but are
+ * region-sized — never the borough-level vantage callers are asking for. */
+const REGION_COUNTIES = new Set([
+  "greater london",
+  "greater manchester",
+  "west midlands",
+  "merseyside",
+  "west yorkshire",
+  "south yorkshire",
+  "tyne and wear",
+]);
+
+/** Resolves a council/borough NAME to its canonical catalogue entry. Plain
+ * names often collide ("Bromley" is also a hamlet) and resolveLocation
+ * deliberately refuses ambiguous plain names, so the formal spellings the
+ * catalogue actually lists ("London Borough of Bromley") are tried too.
+ * Region-sized counties are refused outright. */
+function resolveCouncil(index: UkLocationIndex | null, name: string): string | null {
+  const n = name.trim();
+  if (!n || REGION_COUNTIES.has(n.toLowerCase())) return null;
+  const forms = [
+    n,
+    `London Borough of ${n}`,
+    `Royal Borough of ${n}`,
+    `City of ${n}`,
+    ...(n.includes(" and ") ? n.split(" and ").map((s) => s.trim()) : []),
+  ];
+  for (const f of forms) {
+    const r = resolveLocation(index, f);
+    if (r.valid) return r.name;
+  }
+  return null;
+}
+
 /**
  * Resolves a town to the most realistic geo-target available, using the
  * domain's postcode district to break ties and to stand in for towns the
@@ -246,13 +281,13 @@ export async function resolveTownForDistrict(
     if (matches.length === 1) return matches[0];
   }
   for (const borough of await lookupPlaceBoroughs(town, hints)) {
-    const r = resolveLocation(index, borough);
-    if (r.valid) return r.name;
+    const r = resolveCouncil(index, borough);
+    if (r) return r;
   }
   if (info) {
     for (const council of info.adminDistricts) {
-      const r = resolveLocation(index, council);
-      if (r.valid) return r.name;
+      const r = resolveCouncil(index, council);
+      if (r) return r;
     }
   }
   return null;
@@ -280,12 +315,8 @@ export async function resolveBoroughForLocation(
   if (town) candidates.push(...(await lookupPlaceBoroughs(town, hints)));
   if (info) candidates.push(...info.adminDistricts);
   for (const cand of candidates) {
-    // "Barking and Dagenham" style council names fall back to their parts,
-    // which is what the Google Ads catalogue lists.
-    for (const name of [cand, ...(cand.includes(" and ") ? cand.split(" and ") : [])]) {
-      const r = resolveLocation(index, name.trim());
-      if (r.valid) return r.name;
-    }
+    const r = resolveCouncil(index, cand);
+    if (r) return r;
   }
   return null;
 }
