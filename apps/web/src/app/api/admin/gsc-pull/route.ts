@@ -48,33 +48,56 @@ export async function GET(request: NextRequest) {
   const offset = Math.max(0, Number(request.nextUrl.searchParams.get("offset") ?? 0));
   const limit = Math.min(80, Math.max(1, Number(request.nextUrl.searchParams.get("limit") ?? 60)));
   const startDate = request.nextUrl.searchParams.get("start") ?? "2026-09-01";
-  const endDate = new Date().toISOString().slice(0, 10);
+  const endDate = request.nextUrl.searchParams.get("end") ?? new Date().toISOString().slice(0, 10);
+  // ?match= narrows to matching properties; ?dims= sets the dimension set,
+  // comma-separated, with "~" combining two dimensions in one request
+  // (query~page). Defaults preserve the original behaviour: all properties,
+  // daily series.
+  const match = new RegExp(request.nextUrl.searchParams.get("match") ?? ".", "i");
+  const dimSets = (request.nextUrl.searchParams.get("dims") ?? "date").split(",").slice(0, 4);
+  const rowLimit = Math.min(5000, Number(request.nextUrl.searchParams.get("rows") ?? 1000));
 
   const all = (await listProperties(accessToken))
-    .filter((p) => p.permissionLevel !== "siteUnverifiedUser")
+    .filter((p) => p.permissionLevel !== "siteUnverifiedUser" && match.test(p.siteUrl))
     .sort((a, b) => a.siteUrl.localeCompare(b.siteUrl));
   const page = all.slice(offset, offset + limit);
 
-  const results: { siteUrl: string; rows?: Row[]; error?: string }[] = [];
+  const results: { siteUrl: string; byDim?: Record<string, Row[]>; rows?: Row[]; error?: string }[] = [];
   for (const p of page) {
-    try {
-      const res = await fetch(
-        `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(p.siteUrl)}/searchAnalytics/query`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ startDate, endDate, dimensions: ["date"], rowLimit: 1000, dataState: "all" }),
-        },
-      );
-      if (!res.ok) {
-        results.push({ siteUrl: p.siteUrl, error: `${res.status}: ${(await res.text()).slice(0, 120)}` });
-        continue;
+    const byDim: Record<string, Row[]> = {};
+    let error: string | undefined;
+    for (const dimSet of dimSets) {
+      try {
+        const res = await fetch(
+          `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(p.siteUrl)}/searchAnalytics/query`,
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              startDate,
+              endDate,
+              dimensions: dimSet.split(/[~+ ]/).slice(0, 2),
+              rowLimit,
+              dataState: "all",
+            }),
+          },
+        );
+        if (!res.ok) {
+          error = `${dimSet} ${res.status}: ${(await res.text()).slice(0, 120)}`;
+          continue;
+        }
+        byDim[dimSet] = ((await res.json()) as { rows?: Row[] }).rows ?? [];
+      } catch (e) {
+        error = e instanceof Error ? e.message.slice(0, 120) : "fetch failed";
       }
-      results.push({ siteUrl: p.siteUrl, rows: ((await res.json()) as { rows?: Row[] }).rows ?? [] });
-    } catch (e) {
-      results.push({ siteUrl: p.siteUrl, error: e instanceof Error ? e.message.slice(0, 120) : "failed" });
     }
+    results.push({
+      siteUrl: p.siteUrl,
+      byDim,
+      rows: byDim["date"],
+      ...(error ? { error } : {}),
+    });
   }
 
-  return NextResponse.json({ total: all.length, offset, limit, startDate, endDate, results });
+  return NextResponse.json({ total: all.length, offset, limit, startDate, endDate, dims: dimSets, results });
 }
