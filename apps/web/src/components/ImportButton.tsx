@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-// Drives the chunked backfill: keeps calling /api/google/import until done.
+// Refresh recent final days once, then resume unchecked dates newest first.
 export function ImportButton({ propertyId, alreadyImported }: { propertyId: string; alreadyImported: boolean }) {
   const router = useRouter();
   const [state, setState] = useState<"idle" | "running" | "done" | "error">("idle");
@@ -19,14 +19,14 @@ export function ImportButton({ propertyId, alreadyImported }: { propertyId: stri
         const res = await fetch("/api/google/import", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ propertyId }),
+          body: JSON.stringify({ propertyId, refreshRecent: i === 0 }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-        setMessage(`${data.importedDays} of ${data.totalDays} days imported…`);
+        setMessage(`${data.importedDays} of ${data.totalDays} days checked — latest ${data.newestDate}`);
         if (data.done) {
           setState("done");
-          setMessage("Import complete.");
+          setMessage(`Import complete through ${data.newestDate}.`);
           router.refresh();
           return;
         }

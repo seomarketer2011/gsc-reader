@@ -1,14 +1,16 @@
-// Chunked Search Console backfill (server only). Imports day-by-day, newest
-// first, in small chunks so each request stays within Worker subrequest
-// limits; the client loops until done. Idempotent: re-imports upsert on the
-// (property, date, query, page) primary key.
-
+// Server-only, resumable GSC imports. Checkpoints represent successful API
+// reads, including empty days; performance rows cannot serve as a cursor.
 import { SupabaseClient } from "@supabase/supabase-js";
 import { decryptToken, refreshAccessToken } from "./oauth";
 
-export const BACKFILL_DAYS = 486; // ~16 months
+export const BACKFILL_DAYS = 486;
 export const CHUNK_DAYS = 14;
-const FRESHNESS_LAG = 3; // GSC data is final ~2-3 days behind
+const FRESHNESS_LAG = 3;
+const REFRESH_DAYS = 5;
+const PAGE_SIZE = 25000;
+const WRITE_BATCH_SIZE = 1000;
+
+type Property = { id: string; organisation_id: string; property_uri: string; google_connection_id: string };
 
 const day = (offset: number) => {
   const d = new Date();
@@ -23,24 +25,53 @@ interface GscRow {
   position: number;
 }
 
-async function fetchDay(accessToken: string, propertyUri: string, date: string): Promise<GscRow[]> {
-  const res = await fetch(
-    `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(propertyUri)}/searchAnalytics/query`,
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        startDate: date,
-        endDate: date,
-        dimensions: ["query", "page"],
-        rowLimit: 25000,
-        dataState: "final",
-      }),
-    },
-  );
-  if (!res.ok) throw new Error(`searchAnalytics.query ${date} failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as { rows?: GscRow[] };
-  return data.rows ?? [];
+async function getAccessToken(service: SupabaseClient, property: Property) {
+  const { data: conn, error } = await service.from("google_connections")
+    .select("refresh_token_encrypted").eq("id", property.google_connection_id).single();
+  if (error) throw new Error(`Connection lookup failed: ${error.message}`);
+  if (!conn?.refresh_token_encrypted) throw new Error("Connection has no stored token");
+  return refreshAccessToken(await decryptToken(conn.refresh_token_encrypted));
+}
+
+async function importDay(service: SupabaseClient, property: Property, accessToken: string, date: string) {
+  let rowsImported = 0;
+  // GSC returns at most 25,000 rows per response. Request subsequent pages
+  // before marking the day complete. Google may still omit anonymised queries.
+  for (let startRow = 0; ; startRow += PAGE_SIZE) {
+    const res = await fetch(
+      `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(property.property_uri)}/searchAnalytics/query`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          startDate: date, endDate: date, dimensions: ["query", "page"],
+          rowLimit: PAGE_SIZE, startRow, dataState: "final",
+        }),
+      },
+    );
+    if (!res.ok) throw new Error(`searchAnalytics.query ${date} failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+    const { rows = [] } = (await res.json()) as { rows?: GscRow[] };
+    for (let offset = 0; offset < rows.length; offset += WRITE_BATCH_SIZE) {
+      const payload = rows.slice(offset, offset + WRITE_BATCH_SIZE).map((r) => ({
+        organisation_id: property.organisation_id, gsc_property_id: property.id,
+        date, query: r.keys[0], page: r.keys[1], clicks: r.clicks, impressions: r.impressions,
+        position: Math.round(r.position * 100) / 100,
+      }));
+      const { error } = await service.from("gsc_performance_daily")
+        .upsert(payload, { onConflict: "gsc_property_id,date,query,page" });
+      if (error) throw new Error(`upsert ${date} failed: ${error.message}`);
+      rowsImported += payload.length;
+    }
+    if (rows.length < PAGE_SIZE) break;
+  }
+  // Persist only after every page and write succeeds. A failed date is retried;
+  // already-written rows are safe to upsert again. Empty dates also advance.
+  const { error } = await service.from("gsc_import_days").upsert({
+    gsc_property_id: property.id, date, rows_imported: rowsImported,
+    completed_at: new Date().toISOString(),
+  }, { onConflict: "gsc_property_id,date" });
+  if (error) throw new Error(`checkpoint ${date} failed: ${error.message}`);
+  return rowsImported;
 }
 
 export interface ImportProgress {
@@ -49,109 +80,46 @@ export interface ImportProgress {
   totalDays: number;
   rowsImported: number;
   oldestDate: string | null;
+  newestDate: string;
 }
 
-/** Imports the next CHUNK_DAYS going backwards from the oldest imported date. */
+/** Fill unchecked dates newest first; refresh the most recent final days only
+ * on the first request of a user-started run, not on every chunk. */
 export async function importNextChunk(
   service: SupabaseClient,
-  property: { id: string; organisation_id: string; property_uri: string; google_connection_id: string },
+  property: Property,
+  refreshRecent = true,
 ): Promise<ImportProgress> {
-  const { data: conn } = await service
-    .from("google_connections")
-    .select("refresh_token_encrypted")
-    .eq("id", property.google_connection_id)
-    .single();
-  if (!conn?.refresh_token_encrypted) throw new Error("Connection has no stored token");
-  const accessToken = await refreshAccessToken(await decryptToken(conn.refresh_token_encrypted));
-
-  const newest = day(FRESHNESS_LAG);
-  const oldestTarget = day(FRESHNESS_LAG + BACKFILL_DAYS);
-
-  const { data: oldestRow } = await service
-    .from("gsc_performance_daily")
-    .select("date")
-    .eq("gsc_property_id", property.id)
-    .order("date", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  // Resume from the day before the oldest imported date.
-  let cursor: string;
-  if (!oldestRow) cursor = newest;
-  else {
-    const d = new Date(`${oldestRow.date}T00:00:00Z`);
-    d.setUTCDate(d.getUTCDate() - 1);
-    cursor = d.toISOString().slice(0, 10);
-  }
-
+  const dates = Array.from({ length: BACKFILL_DAYS }, (_, i) => day(FRESHNESS_LAG + i));
+  const { data, error } = await service.from("gsc_import_days").select("date")
+    .eq("gsc_property_id", property.id).gte("date", dates[dates.length - 1])
+    .lte("date", dates[0]).limit(BACKFILL_DAYS);
+  if (error) throw new Error(`Import progress lookup failed: ${error.message}`);
+  const completed = new Set<string>((data ?? []).map((row) => row.date));
+  const pending = dates.filter((date, index) => !completed.has(date) || (refreshRecent && index < REFRESH_DAYS));
+  const chunk = pending.slice(0, CHUNK_DAYS);
   let rowsImported = 0;
-  let processed = 0;
-  while (processed < CHUNK_DAYS && cursor >= oldestTarget) {
-    const rows = await fetchDay(accessToken, property.property_uri, cursor);
-    if (rows.length > 0) {
-      const payload = rows.map((r) => ({
-        organisation_id: property.organisation_id,
-        gsc_property_id: property.id,
-        date: cursor,
-        query: r.keys[0],
-        page: r.keys[1],
-        clicks: r.clicks,
-        impressions: r.impressions,
-        position: Math.round(r.position * 100) / 100,
-      }));
-      const { error } = await service
-        .from("gsc_performance_daily")
-        .upsert(payload, { onConflict: "gsc_property_id,date,query,page" });
-      if (error) throw new Error(`upsert ${cursor} failed: ${error.message}`);
-      rowsImported += payload.length;
+  if (chunk.length) {
+    const accessToken = await getAccessToken(service, property);
+    for (const date of chunk) {
+      rowsImported += await importDay(service, property, accessToken, date);
+      completed.add(date);
     }
-    const d = new Date(`${cursor}T00:00:00Z`);
-    d.setUTCDate(d.getUTCDate() - 1);
-    cursor = d.toISOString().slice(0, 10);
-    processed++;
   }
-
-  const done = cursor < oldestTarget;
-  const importedDays = Math.min(
-    BACKFILL_DAYS,
-    Math.round((new Date(newest).getTime() - new Date(cursor).getTime()) / 86400000),
-  );
-  return { done, importedDays, totalDays: BACKFILL_DAYS, rowsImported, oldestDate: cursor };
+  const checked = dates.filter((date) => completed.has(date));
+  return {
+    done: pending.length <= CHUNK_DAYS,
+    importedDays: checked.length, totalDays: BACKFILL_DAYS, rowsImported,
+    oldestDate: checked.at(-1) ?? null, newestDate: dates[0],
+  };
 }
 
-/** Nightly top-up: re-imports the last few days (GSC finalises data late). */
-export async function importRecentDays(
-  service: SupabaseClient,
-  property: { id: string; organisation_id: string; property_uri: string; google_connection_id: string },
-  days = 5,
-): Promise<number> {
-  const { data: conn } = await service
-    .from("google_connections")
-    .select("refresh_token_encrypted")
-    .eq("id", property.google_connection_id)
-    .single();
-  if (!conn?.refresh_token_encrypted) throw new Error("Connection has no stored token");
-  const accessToken = await refreshAccessToken(await decryptToken(conn.refresh_token_encrypted));
+/** Explicit top-up used by the existing manual cron endpoint. */
+export async function importRecentDays(service: SupabaseClient, property: Property, days = REFRESH_DAYS): Promise<number> {
+  const accessToken = await getAccessToken(service, property);
   let rowsImported = 0;
   for (let offset = FRESHNESS_LAG; offset < FRESHNESS_LAG + days; offset++) {
-    const date = day(offset);
-    const rows = await fetchDay(accessToken, property.property_uri, date);
-    if (rows.length === 0) continue;
-    const payload = rows.map((r) => ({
-      organisation_id: property.organisation_id,
-      gsc_property_id: property.id,
-      date,
-      query: r.keys[0],
-      page: r.keys[1],
-      clicks: r.clicks,
-      impressions: r.impressions,
-      position: Math.round(r.position * 100) / 100,
-    }));
-    const { error } = await service
-      .from("gsc_performance_daily")
-      .upsert(payload, { onConflict: "gsc_property_id,date,query,page" });
-    if (error) throw new Error(`upsert ${date} failed: ${error.message}`);
-    rowsImported += payload.length;
+    rowsImported += await importDay(service, property, accessToken, day(offset));
   }
   return rowsImported;
 }
