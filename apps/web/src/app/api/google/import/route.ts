@@ -9,8 +9,14 @@ export async function POST(request: NextRequest) {
   const user = supabase ? (await supabase.auth.getUser()).data.user : null;
   if (!user) return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
 
-  const { propertyId } = (await request.json().catch(() => ({}))) as { propertyId?: string };
-  if (!propertyId) return NextResponse.json({ error: "propertyId required" }, { status: 400 });
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body !== "object" || typeof body.propertyId !== "string" || !body.propertyId) {
+    return NextResponse.json({ error: "propertyId required" }, { status: 400 });
+  }
+  const { propertyId, refreshRecent = true } = body;
+  if (typeof refreshRecent !== "boolean") {
+    return NextResponse.json({ error: "refreshRecent must be a boolean" }, { status: 400 });
+  }
 
   // RLS proves membership: the row is only visible if the user is in its org.
   const { data: property } = await supabase!
@@ -24,7 +30,7 @@ export async function POST(request: NextRequest) {
   if (!service) return NextResponse.json({ error: "service key missing" }, { status: 500 });
 
   try {
-    const progress = await importNextChunk(service, property);
+    const progress = await importNextChunk(service, property, refreshRecent);
     await service.from("sync_runs").insert({
       organisation_id: property.organisation_id,
       gsc_property_id: property.id,

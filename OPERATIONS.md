@@ -254,12 +254,16 @@ pause the project.
    account that owns the GSC properties (read-only). Properties then list here.
 3. **Track a property** (search box helps with large accounts) — this registers
    it and creates a site record.
-4. **Import 16 months** — button next to each tracked property; runs in chunks
-   with a progress counter, resumable, safe to re-run. Do this once per site;
-   the nightly cron keeps it fresh afterwards.
+4. **Import 16 months / Resume / update import** — button next to each tracked
+   property. Each manual run refreshes the latest five finalised days, then
+   fetches unchecked dates newest first in 14-day chunks over a 486-day window.
+   Successful days (including empty ones) are saved in `gsc_import_days`, so
+   interruptions resume and empty history cannot stall progress. The initial
+   run after installing this fix rechecks the window; old performance rows
+   alone do not establish complete coverage. Data uses a three-day lag and
+   `dataState: final`. Nothing runs automatically; press the button to update.
 5. **Run analysis** (button on the Opportunity Inbox) — runs all detectors +
-   the network pass across every tracked property. The nightly cron also does
-   this automatically.
+   the network pass across every tracked property. This is also manual.
 6. Work the **Opportunity Inbox** (filter/sort/dismiss/save filters), the
    **Coverage matrix** (cross-site topic coverage), **Sites**, **Query
    clusters**, **Keyword research**, and **Rollouts**.
